@@ -5,7 +5,6 @@ import { Router, sendJson } from "./lib/router.ts";
 import { registerDemoRoutes } from "./routes/demo.ts";
 import { registerBriefRoutes } from "./routes/brief.ts";
 import { registerProductionRoutes } from "./routes/production.ts";
-import { registerElevenLabsRoutes } from "./routes/elevenlabs.ts";
 import { registerCopilotRoutes } from "./routes/copilot.ts";
 import { conversationService } from "./services/conversationService.ts";
 import { briefService } from "./services/briefService.ts";
@@ -19,11 +18,15 @@ import { copilotProviderName, createCopilotProvider } from "./services/copilotSe
  * Runs on plain Node (>= 22.18 / 24) with native TypeScript type
  * stripping — no build step, no runtime dependencies.
  *
+ * Voice is browser-native (Web Speech API — free STT + TTS in the client);
+ * the ElevenLabs conversational-agent integration is retired and its route
+ * is intentionally NOT registered, so no credit-consuming voice session can
+ * ever be created.
+ *
  * Provider credentials come from the environment and are never exposed
  * to the browser:
- *   ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID  — live voice conversation
- *   COPILOT_WORKFLOW_URL, COPILOT_AUTH_TOKEN — Copilot Studio brain (live mode)
- *   GEMINI_API_KEY, COMPOSIO_API_KEY         — future integrations (still mocked)
+ *   COPILOT_WORKFLOW_URL, COPILOT_AUTH_TOKEN — Activepieces /sync → Groq brain (live mode)
+ *   GEMINI_API_KEY, COMPOSIO_API_KEY         — production pipeline (still mocked)
  */
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -33,11 +36,14 @@ const PORT = Number(process.env.PORT ?? 3000);
 const router = new Router(STATIC_ROOT);
 const copilotProvider = createCopilotProvider(conversationService);
 
-function voiceProviderName(): "elevenlabs" | "simulation" | "unconfigured" {
-  if ((process.env.VOICE_PROVIDER ?? "").toLowerCase() === "simulation") return "simulation";
-  return process.env.ELEVENLABS_API_KEY && process.env.ELEVENLABS_AGENT_ID
-    ? "elevenlabs"
-    : "unconfigured";
+/**
+ * "browser"     — default: free Web Speech API voice in the client
+ * "simulation"  — force the typed text simulation (VOICE_PROVIDER=simulation)
+ */
+function voiceProviderName(): "browser" | "simulation" {
+  return (process.env.VOICE_PROVIDER ?? "").toLowerCase() === "simulation"
+    ? "simulation"
+    : "browser";
 }
 
 router.get("/api/health", ({ res }) => {
@@ -54,7 +60,6 @@ router.get("/api/health", ({ res }) => {
 registerDemoRoutes(router, conversationService);
 registerBriefRoutes(router, briefService, conversationService);
 registerProductionRoutes(router, productionService, briefService);
-registerElevenLabsRoutes(router);
 registerCopilotRoutes(router, copilotProvider, conversationService);
 
 const server = createServer((req, res) => {

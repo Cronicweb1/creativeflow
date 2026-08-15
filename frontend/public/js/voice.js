@@ -39,17 +39,57 @@ const DEBUG =
   })();
 
 function dlog(...args) {
-  if (DEBUG) console.info("[CreativeFlow STT]", ...args);
+  if (DEBUG) console.info("[voice]", ...args);
 }
 
 function recognitionCtor() {
   return window.SpeechRecognition || window.webkitSpeechRecognition || null;
 }
 
-/** Full BCP-47 locale — Chrome recognizes far better with "en-US" than "en". */
+/**
+ * STT language — FIXED to "en-US".
+ * ROOT-CAUSE FIX: this used to derive from navigator.language, so on any
+ * browser whose OS/UI locale isn't US English (e.g. hi-IN) Chrome ran
+ * recognition in that locale and spoken ENGLISH produced no transcript
+ * while the UI still showed "Listening…". The demo speaks English.
+ * Power users can override via localStorage.cf_stt_lang = "xx-XX".
+ */
 function speechLang() {
-  const lang = navigator.language || "en-US";
-  return lang.includes("-") ? lang : { en: "en-US", hi: "hi-IN" }[lang] || `${lang}-US`;
+  try {
+    const override = window.localStorage?.getItem?.("cf_stt_lang");
+    if (override) return override;
+  } catch {
+    /* storage unavailable (private mode) */
+  }
+  return "en-US";
+}
+
+/** Coarse browser detection — SpeechRecognition support is browser-specific. */
+export function browserName() {
+  const ua = (navigator.userAgent || "").toLowerCase();
+  if (ua.includes("firefox")) return "firefox";
+  if (ua.includes("edg/")) return "edge";
+  if (ua.includes("chrome") || ua.includes("crios")) return "chrome";
+  if (ua.includes("safari")) return "safari";
+  return "other";
+}
+
+/** Dev diagnostic surface: window.__creativeFlowVoiceDebug — NO secrets. */
+function dbg(patch) {
+  try {
+    const d = (window.__creativeFlowVoiceDebug = window.__creativeFlowVoiceDebug || {
+      supported: null,
+      listening: false,
+      speaking: false,
+      processing: false,
+      lastError: null,
+      lastInterimTranscript: "",
+      lastFinalTranscript: "",
+    });
+    Object.assign(d, patch);
+  } catch {
+    /* diagnostics must never break the app */
+  }
 }
 
 /** Strip Markdown/code fences so TTS never reads formatting aloud. */
@@ -71,7 +111,18 @@ const MAX_SILENT_RESTARTS = 2; // bounded — never restart indefinitely
 export class BrowserVoiceInput {
   /** True when this browser can do free, native speech recognition. */
   static isSupported() {
-    return Boolean(recognitionCtor()) && typeof window.speechSynthesis !== "undefined";
+    // NEVER claim voice support merely because navigator.mediaDevices exists:
+    // SpeechRecognition is browser-specific (Chrome/Edge/Safari — NOT Firefox)
+    // and microphone access requires a secure (HTTPS) context.
+    const supported =
+      window.isSecureContext !== false &&
+      Boolean(recognitionCtor()) &&
+      typeof window.speechSynthesis !== "undefined";
+    dbg({ supported });
+    if (!supported) {
+      dlog("voice input unsupported (browser:", browserName(), "secureContext:", String(window.isSecureContext) + ")");
+    }
+    return supported;
   }
 
   constructor() {
@@ -105,6 +156,18 @@ export class BrowserVoiceInput {
     if (!navigator.mediaDevices?.getUserMedia) {
       return { granted: false, reason: "unsupported" };
     }
+    dlog("requesting microphone…");
+    // Permissions API (where supported) tells us the state up-front — handle
+    // granted/prompt/denied without assuming the API exists in every browser.
+    try {
+      const st = await navigator.permissions?.query?.({ name: "microphone" });
+      if (st?.state) {
+        dlog("microphone permission state:", st.state);
+        if (st.state === "denied") return { granted: false, reason: "denied" };
+      }
+    } catch {
+      /* permissions API absent (Safari/older) — fall through to getUserMedia */
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       // SpeechRecognition manages its own capture — release the probe stream.
@@ -125,7 +188,11 @@ export class BrowserVoiceInput {
       this.onError?.("unsupported");
       return;
     }
-    if (this.muted || this.listening) return;
+    // RACE FIX: guard on the recognition INSTANCE, not just this.listening.
+    // this.listening only turns true at onstart — a second call in the
+    // start→onstart window used to spawn a second recognizer whose orphaned
+    // onend desynced the state machine (mic looked live, transcripts lost).
+    if (this.muted || this.listening || this.recognition) return;
     if (this.isSpeaking()) {
       // Never listen while the AI is speaking — but do NOT silently drop the
       // turn: retry briefly until playback state clears (bounded).
@@ -169,9 +236,18 @@ export class BrowserVoiceInput {
     rec.onstart = () => {
       clearTimeout(startWatchdog);
       this.listening = true;
-      dlog("recognition started, lang =", rec.lang);
+      dlog("recognition started, lang =", rec.lang, "browser =", browserName());
+      dbg({ listening: true, lastError: null });
+      // UI shows "Listening…" ONLY from this event — never from a click.
       this.onListeningStateChange?.(true);
     };
+
+    // Diagnostic lifecycle events — make "mic looks on but hears nothing"
+    // debuggable: audiostart proves capture, speechstart proves detection.
+    rec.onaudiostart = () => dlog("audio capture started (microphone is live)");
+    rec.onspeechstart = () => dlog("speech detected");
+    rec.onspeechend = () => dlog("speech ended");
+    rec.onaudioend = () => dlog("audio capture ended");
 
     rec.onresult = (event) => {
       let interim = "";
@@ -181,28 +257,39 @@ export class BrowserVoiceInput {
         else interim += res[0].transcript;
       }
       // Interim transcripts are DISPLAY ONLY — they are never submitted.
-      if (interim) this.onInterim?.(interim.trim());
+      if (interim) {
+        dlog("interim transcript:", interim.trim());
+        dbg({ lastInterimTranscript: interim.trim() });
+        this.onInterim?.(interim.trim());
+      }
     };
 
     rec.onerror = (event) => {
-      dlog("recognition error:", event.error);
+      dlog("recognition error:", event.error, event.message ?? "");
+      dbg({ lastError: event.error });
+      // Explicit mapping — never silently swallow recognition errors.
       if (event.error === "not-allowed" || event.error === "service-not-allowed") {
         this._silentRestarts = MAX_SILENT_RESTARTS; // don't retry
-        this.onError?.("denied");
+        this.onError?.("denied"); // "Microphone permission was denied."
       } else if (event.error === "audio-capture") {
         this._silentRestarts = MAX_SILENT_RESTARTS;
-        this.onError?.("audio");
+        this.onError?.("audio"); // "No microphone input was detected."
       } else if (event.error === "network") {
         this._silentRestarts = MAX_SILENT_RESTARTS;
-        this.onError?.("network");
+        this.onError?.("network"); // "Speech recognition service is unavailable."
+      } else if (event.error === "language-not-supported") {
+        this._silentRestarts = MAX_SILENT_RESTARTS;
+        this.onError?.("language"); // recognition language unavailable on device
       }
-      // "no-speech" / "aborted" are routine — handled by onend.
+      // "no-speech" → bounded-restart path in onend ("I didn't hear anything").
+      // "aborted" → routine (stop/teardown) — handled by onend.
     };
 
     rec.onend = () => {
       clearTimeout(startWatchdog);
       this.listening = false;
-      this.recognition = null;
+      if (this.recognition === rec) this.recognition = null;
+      dbg({ listening: false });
       this.onListeningStateChange?.(false);
       this.onInterim?.("");
 
@@ -212,6 +299,7 @@ export class BrowserVoiceInput {
         this._submittedThisSession = true;
         this._silentRestarts = 0;
         dlog("final transcript:", text);
+        dbg({ lastFinalTranscript: text, lastInterimTranscript: "" });
         this.onTranscript?.(text);
         return;
       }
@@ -232,8 +320,17 @@ export class BrowserVoiceInput {
 
     try {
       rec.start();
-    } catch {
-      /* start() throws if a session is already active — harmless */
+    } catch (err) {
+      // Never swallow this silently: an InvalidStateError here means a
+      // session was already active (prevented above); anything else means
+      // recognition could not start at all — surface it.
+      clearTimeout(startWatchdog);
+      dlog("recognition.start() threw:", err?.name, err?.message);
+      if (this.recognition === rec) this.recognition = null;
+      if (err?.name !== "InvalidStateError") {
+        dbg({ lastError: err?.name || "start-failed" });
+        this.onError?.(err?.name === "NotAllowedError" ? "denied" : "start-failed");
+      }
     }
   }
 
@@ -400,6 +497,7 @@ export class BrowserVoiceInput {
   _setSpeaking(speaking) {
     if (this._speaking === speaking) return;
     this._speaking = speaking;
+    dbg({ speaking });
     this.onSpeakingStateChange?.(speaking);
   }
 

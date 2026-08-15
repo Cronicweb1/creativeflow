@@ -2,16 +2,22 @@ import type { Router } from "../lib/router.ts";
 import { sendJson } from "../lib/router.ts";
 
 /**
- * ElevenLabs Agents integration.
+ * RETIRED — ElevenLabs Agents integration.
+ *
+ * This route is intentionally NOT registered in server.ts any more.
+ * The ElevenLabs Conversational AI agent was removed from the CreativeFlow
+ * conversation loop because it consumed credits too quickly; voice now runs
+ * free in the browser (Web Speech API STT + speechSynthesis TTS) and the
+ * conversational brain is the Activepieces /sync → Groq workflow behind
+ * POST /api/copilot/turn.
+ *
+ * The file is kept isolated (dead code, never executed) in case ElevenLabs
+ * is ever needed again for an unrelated, non-conversational feature. To
+ * re-enable, import and call registerElevenLabsRoutes() in server.ts.
  *
  * GET /api/elevenlabs/token → { token }
  *
- * The browser never sees ELEVENLABS_API_KEY. This endpoint uses the
- * server-side key to mint a short-lived ElevenLabs *conversation token*
- * for the configured agent; the frontend uses that token to open a
- * WebRTC voice session directly with ElevenLabs.
- *
- * Configuration (Render dashboard → creativeflow → Environment):
+ * Configuration (only if ever re-enabled):
  *   ELEVENLABS_API_KEY   — secret ElevenLabs API key (server-only)
  *   ELEVENLABS_AGENT_ID  — the ElevenLabs Agents agent id
  */

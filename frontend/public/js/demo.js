@@ -5,22 +5,23 @@
  *   precall → call → confirm → production → result
  *
  * Layered architecture:
- *   ElevenLabs     = voice/audio transport (mic, ASR, TTS, WebRTC)
- *   Copilot Studio = conversational intelligence — decides every reply
- *                    and owns the structured requirement state
- *   Render backend = secure bridge + session/state layer
+ *   Browser Web Speech API = voice layer (free STT + TTS, no credits)
+ *   Activepieces → Groq    = conversational intelligence — decides every
+ *                            reply and owns the structured requirement state
+ *   Render backend         = secure bridge + session/state layer
  *
- * Two runtime modes, chosen by the server (/api/health):
+ * The browser owns the conversation loop. Every turn flows:
  *
- *   voice === "elevenlabs"  — real spoken conversation. Each turn flows
- *     mic → ElevenLabs ASR → backend custom-LLM bridge → Copilot →
- *     ElevenLabs TTS. The browser only displays transcripts and syncs the
- *     Live Creative Brief from GET /api/copilot/state/:id — it never calls
- *     the brain directly, and there is exactly ONE spoken AI response.
+ *   mic → SpeechRecognition (STT) → POST /api/copilot/turn →
+ *   Activepieces /sync → Groq → structured response →
+ *   speechSynthesis (TTS) → back to listening
  *
- *   voice !== "elevenlabs"  — credit-free text simulation. The visitor
- *     types; the browser calls POST /api/copilot/turn and renders
- *     Copilot's responseText. No ElevenLabs session is ever created.
+ * Voice states surfaced to the visitor: Idle · Listening… · Thinking… ·
+ * Speaking… — with typed input always available as a fallback.
+ *
+ * No ElevenLabs conversational-agent session is ever created. When the
+ * browser lacks the Web Speech API (or VOICE_PROVIDER=simulation), the
+ * demo runs as a typed text simulation over the exact same backend turn.
  */
 
 import { api } from "./api.js";
@@ -49,13 +50,15 @@ export class DemoExperience {
     this.callSeconds = 0;
     this.preview = null;
     this.micGranted = false;
-    this.voiceConnected = false;
+    this.voiceState = "idle"; // idle | listening | thinking | speaking
     this.wrappingUp = false;
     this._turnChain = Promise.resolve();
   }
 
   get voiceMode() {
-    return this.health?.voice === "elevenlabs";
+    // Voice is free and browser-native — use it whenever the browser supports
+    // it, unless the server explicitly forces the typed simulation.
+    return this.health?.voice !== "simulation" && BrowserVoiceInput.isSupported();
   }
 
   open() {
@@ -75,13 +78,12 @@ export class DemoExperience {
     clearInterval(this.pollId);
     this.preview?.destroy();
     this.preview = null;
-    this.voice.onStatus = null;
-    this.voice.onMode = null;
-    this.voice.onError = null;
     this.voice.onTranscript = null;
-    this.voice.onAgentTranscript = null;
-    void this.voice.stop(); // ends the ElevenLabs session + stops mic tracks
-    this.voiceConnected = false;
+    this.voice.onInterim = null;
+    this.voice.onListeningStateChange = null;
+    this.voice.onError = null;
+    this.voice.stop(); // stops recognition + TTS + mic tracks (all local, free)
+    this.voiceState = "idle";
     this.wrappingUp = false;
     this.session = null;
     this.brief = null;
@@ -126,7 +128,7 @@ export class DemoExperience {
         <p class="eyebrow">Live client call</p>
         <h2>Ready to start?</h2>
         <p>You'll act as the client. Speak naturally — the AI Creative Agent talks with you and gathers the requirements for your campaign.</p>
-        <p class="mic-note">Microphone access is required for the voice conversation.</p>
+        <p class="mic-note">Microphone access is required. Voice runs in your browser — free, no credits used.</p>
         <button class="btn btn-accent btn-lg" data-a="allow">Allow microphone &amp; start call</button>
         <p class="precall-error" hidden></p>
       </div>
@@ -169,9 +171,9 @@ export class DemoExperience {
         return;
       }
 
-      // 3. Render the call UI, then connect ONE ElevenLabs session.
+      // 3. Render the call UI, then start the browser voice loop.
       this.renderCall();
-      this.connectVoice();
+      this.beginVoiceConversation();
     });
   }
 
@@ -224,7 +226,7 @@ export class DemoExperience {
             </div>
             <p class="agent-name">AI Creative Agent</p>
             <p class="agent-role">Creative Director</p>
-            <p class="call-status"><span class="status-dot"></span><span data-el="status">${voiceMode ? "Connecting to voice agent…" : "Call in progress"}</span></p>
+            <p class="call-status"><span class="status-dot"></span><span data-el="status">${voiceMode ? "Idle" : "Call in progress"}</span></p>
             <p class="call-timer" data-el="timer">00:00</p>
           </div>
           <div class="transcript" data-el="transcript"></div>
@@ -247,7 +249,7 @@ export class DemoExperience {
                 </svg>
               </button>
             </div>
-            <p class="mic-hint" data-el="mic-hint">${voiceMode ? "Connecting to voice agent…" : "Text simulation · no voice credits used"}</p>
+            <p class="mic-hint" data-el="mic-hint">${voiceMode ? "Browser voice · free, no credits used" : "Text simulation · no voice credits used"}</p>
           </div>
         </section>
         <aside class="brief-panel" aria-label="Live creative brief">
@@ -281,28 +283,20 @@ export class DemoExperience {
     this.renderRequirements(this.session.requirements);
     this.renderSuggestions(this.suggestions);
 
-    if (voiceMode) {
-      // History: only what the visitor actually said before (reopened session).
-      // The ElevenLabs agent speaks its own turns — backend text is never
-      // rendered as a second AI voice.
-      for (const msg of this.session.messages) {
-        if (msg.speaker !== "agent") this.appendMessage(msg, false);
-      }
-      this.bindVoiceEvents();
-    } else {
-      // Text mode: render the scripted opening question from the session.
-      for (const msg of this.session.messages) this.appendMessage(msg, false);
-    }
+    // Both modes render the full history — the browser owns TTS, so agent
+    // text is never spoken by a second system.
+    for (const msg of this.session.messages) this.appendMessage(msg, false);
 
-    // Input: typed answers (primary in text mode, optional fallback in voice mode).
+    if (voiceMode) this.bindVoiceEvents();
+
+    // Input: typed answers (always available; primary in text mode).
     this.els.form.addEventListener("submit", (e) => {
       e.preventDefault();
       const input = this.els.form.querySelector("input");
       const text = input.value.trim();
       if (!text) return;
       input.value = "";
-      if (voiceMode) this.voice.submitUtterance(text);
-      else this.handleTextTurn(text);
+      this.handleTurn(text);
     });
 
     const muteBtn = view.querySelector("[data-a=mute]");
@@ -310,103 +304,130 @@ export class DemoExperience {
       const btn = e.currentTarget;
       const muted = !btn.classList.contains("ctl-muted");
       btn.classList.toggle("ctl-muted", muted);
-      this.voice.setMuted(muted); // actually mutes the ElevenLabs mic stream
-      if (this.voiceConnected) {
-        this.setMicHint(muted ? "Microphone muted" : "Microphone connected · Voice agent live");
+      this.voice.setMuted(muted); // muted = recognition stopped entirely
+      if (muted) {
+        this.setVoiceState("idle");
+        this.setMicHint("Microphone muted");
+      } else {
+        this.setMicHint("Browser voice · free, no credits used");
+        if (this.voiceState !== "thinking" && this.voiceState !== "speaking") {
+          this.voice.startListening();
+        }
       }
     });
     view.querySelector("[data-a=end]").addEventListener("click", () => this.close());
   }
 
+  /* ---------- browser voice loop ---------- */
+
   bindVoiceEvents() {
-    this.voice.onStatus = (s) => {
-      if (s === "connecting") {
-        this.setStatus("Connecting to voice agent…");
-        this.setMicHint("Connecting to voice agent…");
-      } else if (s === "connected") {
-        this.voiceConnected = true;
-        this.setModeTag("Live voice call");
-        this.setStatus("Voice agent connected");
-        this.setMicHint("Microphone connected · Voice agent live");
-      } else if (s === "disconnected") {
-        this.voiceConnected = false;
-        if (!this.wrappingUp) {
-          this.setStatus("Call ended");
-          this.setMicHint("Call ended");
-        }
-        this.els?.layout?.classList.remove("call-active");
+    // FINAL visitor utterance from the browser recognizer → one backend turn.
+    this.voice.onTranscript = (text) => this.handleTurn(text);
+    // Live interim transcript — shown in the hint line while speaking.
+    this.voice.onInterim = (text) => {
+      if (this.voiceState === "listening") {
+        this.setMicHint(text ? `“${text}…”` : "Browser voice · free, no credits used");
       }
     };
-    this.voice.onMode = (mode) => {
-      if (!this.voiceConnected) return;
-      this.setStatus(mode === "speaking" ? "AI speaking" : "Listening");
+    this.voice.onListeningStateChange = (listening) => {
+      if (this.wrappingUp) return;
+      if (listening) this.setVoiceState("listening");
+      else if (this.voiceState === "listening") this.setVoiceState("idle");
     };
-    this.voice.onError = (message) => {
-      this.setStatus("Voice connection error");
-      this.setMicHint(message || "Voice connection error");
-      this.els?.layout?.classList.remove("call-active");
-    };
-    // Visitor speech: display it, then sync the brief (Copilot already got
-    // the utterance through the backend custom-LLM bridge — no second call).
-    this.voice.onTranscript = (text) => {
-      this.appendMessage({ speaker: "client", text });
-      this.renderSuggestions([]);
-    };
-    // Agent reply: display it, then pull authoritative state from the bridge.
-    this.voice.onAgentTranscript = (text) => {
-      this.appendMessage({ speaker: "agent", text });
-      this.queueStateSync();
+    this.voice.onError = (reason) => {
+      const message =
+        reason === "unsupported"
+          ? "This browser does not support speech recognition — type your answers below."
+          : reason === "denied"
+            ? "Microphone access was blocked — allow it in the browser, or type your answers below."
+            : reason === "audio"
+              ? "No microphone was found — check your input device, or type your answers below."
+              : "Speech recognition hit a snag — tap the mic to retry, or type your answers below.";
+      this.setVoiceState("idle");
+      this.setMicHint(message);
     };
   }
 
-  async connectVoice() {
-    try {
-      await this.voice.connect({ sessionId: this.session?.sessionId });
-    } catch {
-      /* surfaced via voice.onError → status "Voice connection error" */
-    }
-  }
-
-  /* ---------- Copilot bridge (text mode) ---------- */
-
-  handleTextTurn(text) {
+  /** Speak the agent's opening line, then hand the mic to the visitor. */
+  beginVoiceConversation() {
     this._turnChain = this._turnChain.then(async () => {
       if (!this.session) return;
+      const lastAgent = [...this.session.messages].reverse().find((m) => m.speaker === "agent");
+      if (lastAgent) {
+        this.setVoiceState("speaking");
+        await this.voice.speak(lastAgent.text); // resolves even if TTS unavailable
+      }
+      if (!this.session || this.wrappingUp) return;
+      this.setVoiceState("listening");
+      this.voice.startListening();
+    });
+    return this._turnChain;
+  }
+
+  setVoiceState(state) {
+    this.voiceState = state;
+    if (!this.voiceMode) return;
+    const label = { idle: "Idle", listening: "Listening…", thinking: "Thinking…", speaking: "Speaking…" }[state];
+    if (label) this.setStatus(label);
+  }
+
+  /* ---------- Copilot bridge — ONE turn path for voice and text ---------- */
+
+  handleTurn(text) {
+    this._turnChain = this._turnChain.then(async () => {
+      if (!this.session || this.wrappingUp) return;
+      const voiceMode = this.voiceMode;
+      if (voiceMode) {
+        this.voice.stopSpeaking(); // typing/speaking interrupts current TTS
+        this.voice.stopListening();
+      }
       this.appendMessage({ speaker: "client", text });
       this.renderSuggestions([]);
-      this.setStatus("Thinking…");
+      if (voiceMode) this.setVoiceState("thinking");
+      else this.setStatus("Thinking…");
+
       let turn;
       try {
         turn = await api.copilotTurn(this.session.sessionId, text);
       } catch {
         this.setStatus("Creative intelligence temporarily unavailable");
         this.setMicHint("Creative intelligence temporarily unavailable — please try again.");
+        if (voiceMode && !this.voice.muted) {
+          await pause(1200);
+          this.setVoiceState("listening");
+          this.voice.startListening(); // allow retry by voice
+        }
         return;
       }
-      this.setStatus("Call in progress");
+
       this.setMicHint(
         turn.degraded
           ? "Creative intelligence temporarily unavailable — please try again."
-          : "Text simulation · no voice credits used",
+          : voiceMode
+            ? "Browser voice · free, no credits used"
+            : "Text simulation · no voice credits used",
       );
       this.appendMessage({ speaker: "agent", text: turn.responseText });
       if (turn.requirementList) this.renderRequirements(turn.requirementList);
-      if (turn.complete) await this.wrapUp();
-    });
-    return this._turnChain;
-  }
 
-  /* ---------- Copilot state sync (voice mode) ---------- */
+      if (voiceMode) {
+        // Speak ONLY responseText. If TTS fails the text is already shown.
+        this.setVoiceState("speaking");
+        await this.voice.speak(turn.responseText);
+      } else {
+        this.setStatus("Call in progress");
+      }
 
-  queueStateSync() {
-    this._turnChain = this._turnChain.then(async () => {
-      if (!this.session) return;
-      try {
-        const state = await api.copilotState(this.session.sessionId);
-        this.renderRequirements(state.requirementList);
-        if (state.complete && !this.wrappingUp) await this.wrapUp();
-      } catch {
-        /* transient sync error — try again on the next agent turn */
+      if (turn.complete) {
+        await this.wrapUp();
+        return;
+      }
+
+      if (voiceMode && !this.voice.muted && !this.wrappingUp) {
+        this.setVoiceState("listening");
+        this.voice.startListening(); // playback done — visitor may speak again
+      } else if (voiceMode) {
+        this.setVoiceState("idle");
       }
     });
     return this._turnChain;
@@ -417,10 +438,7 @@ export class DemoExperience {
     this.wrappingUp = true;
     this.setStatus("Wrapping up");
     if (this.els?.briefStatus) this.els.briefStatus.textContent = "Requirements complete";
-    if (this.voiceMode) {
-      await this.voice.stop(); // end the voice session cleanly before review
-      this.voiceConnected = false;
-    }
+    this.voice.stop(); // end recognition + TTS cleanly before review
     await pause(1600);
     await this.renderConfirm();
     this.wrappingUp = false;
@@ -442,10 +460,7 @@ export class DemoExperience {
       b.type = "button";
       b.className = "suggestion";
       b.textContent = text;
-      b.addEventListener("click", () => {
-        if (this.voiceMode) this.voice.submitUtterance(text);
-        else this.handleTextTurn(text);
-      });
+      b.addEventListener("click", () => this.handleTurn(text));
       this.els.suggestions.appendChild(b);
     }
   }
@@ -488,7 +503,7 @@ export class DemoExperience {
 
   async renderConfirm() {
     clearInterval(this.timerId);
-    void this.voice.stop();
+    this.voice.stop();
     this.setModeTag("Simulated production");
     const { brief } = await api.buildBrief(this.session.sessionId);
     this.brief = brief;
@@ -526,7 +541,7 @@ export class DemoExperience {
       this.wrappingUp = false;
       this.setModeTag(this.voiceMode ? "Live voice demo" : "Simulated call");
       this.renderCall();
-      if (this.voiceMode) this.connectVoice(); // reconnect for the follow-up conversation
+      if (this.voiceMode) this.beginVoiceConversation(); // resume the browser voice loop
     });
   }
 

@@ -6,6 +6,7 @@ import { registerDemoRoutes } from "./routes/demo.ts";
 import { registerBriefRoutes } from "./routes/brief.ts";
 import { registerProductionRoutes } from "./routes/production.ts";
 import { registerCopilotRoutes } from "./routes/copilot.ts";
+import { registerTtsRoutes, ttsProviderName } from "./routes/tts.ts";
 import { conversationService } from "./services/conversationService.ts";
 import { briefService } from "./services/briefService.ts";
 import { productionService } from "./services/productionService.ts";
@@ -52,6 +53,7 @@ router.get("/api/health", ({ res }) => {
     service: "creativeflow-api",
     mode: "simulation", // becomes "production" once real generation providers are wired in
     voice: voiceProviderName(),
+    tts: ttsProviderName(),
     copilot: copilotProviderName(),
     time: new Date().toISOString(),
   });
@@ -61,6 +63,7 @@ registerDemoRoutes(router, conversationService);
 registerBriefRoutes(router, briefService, conversationService);
 registerProductionRoutes(router, productionService, briefService);
 registerCopilotRoutes(router, copilotProvider, conversationService);
+registerTtsRoutes(router);
 
 const server = createServer((req, res) => {
   void router.dispatch(req, res);
@@ -69,5 +72,7 @@ const server = createServer((req, res) => {
 server.listen(PORT, () => {
   console.log(`CreativeFlow listening on http://localhost:${PORT}`);
   console.log(`Static root: ${STATIC_ROOT}`);
-  console.log(`Providers — voice: ${voiceProviderName()} · copilot: ${copilotProviderName()}`);
+  console.log(
+    `Providers — voice: ${voiceProviderName()} · tts: ${ttsProviderName()} · copilot: ${copilotProviderName()}`,
+  );
 });

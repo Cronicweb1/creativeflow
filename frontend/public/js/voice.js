@@ -1,40 +1,72 @@
 /**
- * Voice layer — browser-native voice pipeline. No ElevenLabs, no credits.
+ * Voice layer — browser-controlled voice pipeline. No conversational-agent
+ * sessions, no credits burned by the voice loop itself.
  *
- * The browser owns the entire conversation loop:
- *
- *   microphone → Web Speech API SpeechRecognition (STT)
+ *   microphone → Web Speech API SpeechRecognition (STT, free)
  *             → POST /api/copilot/turn  (backend → Activepieces /sync → Groq)
  *             → responseText
- *             → window.speechSynthesis (TTS)
+ *             → POST /api/tts (natural server-side TTS, key stays on server)
+ *                 ↳ fallback: window.speechSynthesis (best available voice)
  *             → back to listening
  *
- * No conversational-agent session is ever opened with any paid provider.
- * The only network calls made by the voice flow are to the CreativeFlow
- * backend itself (same-origin /api/*).
+ * STT lifecycle (single-shot, no unbounded restarts):
+ *   idle → listening → (interim…) → FINAL transcript → stop → submit ONCE
+ * Silence/no-speech restarts are bounded (MAX_SILENT_RESTARTS), after which
+ * the layer goes idle and reports "silence" so the UI can invite a retry.
  *
  * Surface used by demo.js:
- *
- *   BrowserVoiceInput.isSupported()   — feature-detect SpeechRecognition
- *   requestPermission()               — mic permission pre-flight
+ *   BrowserVoiceInput.isSupported()
+ *   requestPermission()
  *   startListening() / stopListening()
- *   onTranscript(text)                — FINAL visitor utterance
- *   onInterim(text)                   — live interim transcript (may be "")
- *   onListeningStateChange(bool)      — recognition started/stopped
- *   onError(reason)                   — "unsupported" | "denied" | "audio" | "network" | message
- *   speak(text) → Promise<bool>       — browser TTS; resolves when playback ends
- *   stopSpeaking() / isSpeaking()     — interrupt / query TTS
- *   setMuted(bool)                    — mute = stop recognition
- *   submitUtterance(text)             — typed fallback, routed like a transcript
- *   stop()                            — full teardown (recognition + TTS + mic)
- *
- * STT and TTS are small abstractions here so either can be swapped for a
- * different engine later without touching demo.js.
+ *   onTranscript(text)            — exactly one FINAL transcript per turn
+ *   onInterim(text)               — live interim transcript ("" to clear)
+ *   onListeningStateChange(bool)
+ *   onSpeakingStateChange(bool)
+ *   onError(reason)               — "unsupported"|"denied"|"audio"|"network"|"silence"|message
+ *   speak(text) → Promise<bool>   — natural TTS w/ browser fallback
+ *   stopSpeaking() / isSpeaking()
+ *   setMuted(bool) / submitUtterance(text) / stop()
  */
+
+const DEBUG =
+  /[?&]debug\b/.test(window.location.search) ||
+  (() => {
+    try {
+      return window.localStorage.getItem("cf_debug") === "1";
+    } catch {
+      return false;
+    }
+  })();
+
+function dlog(...args) {
+  if (DEBUG) console.info("[CreativeFlow STT]", ...args);
+}
 
 function recognitionCtor() {
   return window.SpeechRecognition || window.webkitSpeechRecognition || null;
 }
+
+/** Full BCP-47 locale — Chrome recognizes far better with "en-US" than "en". */
+function speechLang() {
+  const lang = navigator.language || "en-US";
+  return lang.includes("-") ? lang : { en: "en-US", hi: "hi-IN" }[lang] || `${lang}-US`;
+}
+
+/** Strip Markdown/code fences so TTS never reads formatting aloud. */
+export function toSpeakableText(text) {
+  return String(text ?? "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]*)`/g, "$1")
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/[*_~]{1,3}([^*_~]+)[*_~]{1,3}/g, "$1")
+    .replace(/^\s*[-*+]\s+/gm, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const MAX_SILENT_RESTARTS = 2; // bounded — never restart indefinitely
 
 export class BrowserVoiceInput {
   /** True when this browser can do free, native speech recognition. */
@@ -43,21 +75,32 @@ export class BrowserVoiceInput {
   }
 
   constructor() {
-    this.stream = null; // permission pre-flight stream (released immediately)
     this.recognition = null;
     this.listening = false;
     this.muted = false;
     this.onTranscript = null;
     this.onInterim = null;
     this.onListeningStateChange = null;
+    this.onSpeakingStateChange = null;
     this.onError = null;
-    this._shouldListen = false; // desired state — drives silent auto-restart
+    this._silentRestarts = 0;
+    this._submittedThisSession = false; // duplicate-submission guard
     this._speaking = false;
     this._utterance = null;
-    this._restartTimer = 0;
+    this._audio = null; // server TTS playback element
+    this._serverTts = null; // null = unknown, true/false once probed
+    this._voicesReady = false;
+    // Some browsers populate speechSynthesis voices asynchronously.
+    try {
+      window.speechSynthesis?.addEventListener?.("voiceschanged", () => {
+        this._voicesReady = true;
+      });
+    } catch {
+      /* optional */
+    }
   }
 
-  /** Request mic permission up-front so the UX fails fast. Resolves { granted, reason }. */
+  /** Request mic permission explicitly when the user starts the call. */
   async requestPermission() {
     if (!navigator.mediaDevices?.getUserMedia) {
       return { granted: false, reason: "unsupported" };
@@ -66,13 +109,15 @@ export class BrowserVoiceInput {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       // SpeechRecognition manages its own capture — release the probe stream.
       stream.getTracks().forEach((t) => t.stop());
+      dlog("microphone permission granted");
       return { granted: true };
     } catch (err) {
+      dlog("microphone permission failed:", err?.name);
       return { granted: false, reason: err?.name || "denied" };
     }
   }
 
-  /* ---------- speech-to-text ---------- */
+  /* ------------------------ speech-to-text ------------------------ */
 
   startListening() {
     const Ctor = recognitionCtor();
@@ -81,19 +126,21 @@ export class BrowserVoiceInput {
       return;
     }
     if (this.muted || this.listening) return;
-    this._shouldListen = true;
+    if (this.isSpeaking()) return; // never listen while the AI is speaking
 
     const rec = new Ctor();
     this.recognition = rec;
-    rec.lang = document.documentElement.lang || navigator.language || "en-US";
+    rec.lang = speechLang();
     rec.continuous = false; // one utterance per turn
     rec.interimResults = true;
     rec.maxAlternatives = 1;
+    this._submittedThisSession = false;
 
     let finalText = "";
 
     rec.onstart = () => {
       this.listening = true;
+      dlog("recognition started, lang =", rec.lang);
       this.onListeningStateChange?.(true);
     };
 
@@ -104,20 +151,23 @@ export class BrowserVoiceInput {
         if (res.isFinal) finalText += res[0].transcript;
         else interim += res[0].transcript;
       }
+      // Interim transcripts are DISPLAY ONLY — they are never submitted.
       if (interim) this.onInterim?.(interim.trim());
     };
 
     rec.onerror = (event) => {
-      // "no-speech"/"aborted" are routine — the onend auto-restart handles them.
+      dlog("recognition error:", event.error);
       if (event.error === "not-allowed" || event.error === "service-not-allowed") {
-        this._shouldListen = false;
+        this._silentRestarts = MAX_SILENT_RESTARTS; // don't retry
         this.onError?.("denied");
       } else if (event.error === "audio-capture") {
-        this._shouldListen = false;
+        this._silentRestarts = MAX_SILENT_RESTARTS;
         this.onError?.("audio");
       } else if (event.error === "network") {
+        this._silentRestarts = MAX_SILENT_RESTARTS;
         this.onError?.("network");
       }
+      // "no-speech" / "aborted" are routine — handled by onend.
     };
 
     rec.onend = () => {
@@ -125,93 +175,203 @@ export class BrowserVoiceInput {
       this.recognition = null;
       this.onListeningStateChange?.(false);
       this.onInterim?.("");
+
       const text = finalText.trim();
-      if (text) {
-        this._shouldListen = false; // demo restarts listening after the reply is spoken
+      if (text && !this._submittedThisSession) {
+        // Exactly ONE final transcript is submitted per recognition session.
+        this._submittedThisSession = true;
+        this._silentRestarts = 0;
+        dlog("final transcript:", text);
         this.onTranscript?.(text);
-      } else if (this._shouldListen && !this.muted) {
-        // Silence / recognizer timeout — quietly keep listening.
-        clearTimeout(this._restartTimer);
-        this._restartTimer = setTimeout(() => {
-          if (this._shouldListen && !this.muted && !this.listening) this.startListening();
-        }, 250);
+        return;
+      }
+
+      // Ended with no final transcript → NEVER submit an empty request.
+      if (!this.muted && this._silentRestarts < MAX_SILENT_RESTARTS) {
+        this._silentRestarts += 1;
+        dlog(`silence — bounded restart ${this._silentRestarts}/${MAX_SILENT_RESTARTS}`);
+        setTimeout(() => {
+          if (!this.muted && !this.listening && !this.isSpeaking()) this.startListening();
+        }, 300);
+      } else if (!this.muted) {
+        this._silentRestarts = 0;
+        dlog("silence limit reached — going idle");
+        this.onError?.("silence"); // UI invites the user to tap the mic / retry
       }
     };
 
     try {
       rec.start();
     } catch {
-      // start() throws if a session is already active — treat as harmless.
+      /* start() throws if a session is already active — harmless */
     }
   }
 
   stopListening() {
-    this._shouldListen = false;
-    clearTimeout(this._restartTimer);
+    this._silentRestarts = MAX_SILENT_RESTARTS; // block pending restarts
+    const rec = this.recognition;
     try {
-      this.recognition?.stop();
+      rec?.stop();
     } catch {
       /* not started */
     }
+    this._silentRestarts = 0;
   }
 
-  /* ---------- text-to-speech ---------- */
+  /* ------------------------ text-to-speech ------------------------ */
 
   /**
-   * Speak ONLY the given text (never JSON or internal state) with the
-   * browser's built-in speechSynthesis. Resolves true when playback
-   * finished, false when TTS is unavailable/failed or was interrupted —
-   * the caller still shows the text either way.
+   * Speak ONLY plain response text (never JSON/requirements/debug).
+   * Primary: POST /api/tts — natural server-side voice; the provider API key
+   * never leaves the backend. Fallback: window.speechSynthesis with the best
+   * available voice. Resolves true when playback finished, false otherwise.
    */
-  speak(text) {
+  async speak(text) {
+    const clean = toSpeakableText(text);
+    if (!clean) return false;
+    this.stopSpeaking(); // cancel stale utterances/audio before starting
+
+    if (this._serverTts !== false) {
+      const played = await this._speakViaServer(clean);
+      if (played !== null) return played; // played (true/false), provider available
+    }
+    return this._speakViaBrowser(clean);
+  }
+
+  /** Returns true/false when server TTS handled it, null when unavailable. */
+  async _speakViaServer(text) {
+    let res;
+    try {
+      res = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+    } catch {
+      return null; // network problem — use browser fallback for this turn
+    }
+    if (res.status === 503) {
+      this._serverTts = false; // not configured — stop probing this session
+      dlog("server TTS not configured — using browser speechSynthesis");
+      return null;
+    }
+    if (!res.ok) return null;
+
+    let url;
+    try {
+      const blob = await res.blob();
+      if (!blob.size) return null;
+      url = URL.createObjectURL(blob);
+    } catch {
+      return null;
+    }
+
+    this._serverTts = true;
+    return await new Promise((resolve) => {
+      const audio = new Audio(url);
+      this._audio = audio;
+      const done = (ok) => {
+        if (this._audio === audio) {
+          this._audio = null;
+          this._setSpeaking(false);
+        }
+        URL.revokeObjectURL(url);
+        resolve(ok);
+      };
+      audio.onended = () => done(true);
+      audio.onerror = () => done(false);
+      this._setSpeaking(true);
+      audio.play().catch(() => done(false));
+    });
+  }
+
+  /** Pick the most natural English voice this browser exposes. */
+  _pickVoice() {
+    const voices = window.speechSynthesis?.getVoices?.() ?? [];
+    if (!voices.length) return null;
+    const lang = speechLang();
+    const score = (v) => {
+      let s = 0;
+      const name = (v.name || "").toLowerCase();
+      if (v.lang === lang) s += 4;
+      else if (v.lang?.startsWith(lang.split("-")[0])) s += 2;
+      // Neural/enhanced voices, by capability keywords — never a hard-coded name.
+      if (/natural|neural|enhanced|premium|online/.test(name)) s += 4;
+      if (name.includes("google")) s += 3;
+      if (v.localService === false) s += 1; // cloud voices usually sound better
+      if (v.default) s += 1;
+      return s;
+    };
+    return voices.slice().sort((a, b) => score(b) - score(a))[0] ?? null;
+  }
+
+  _speakViaBrowser(text) {
     return new Promise((resolve) => {
       const synth = window.speechSynthesis;
-      if (!synth || !text || !String(text).trim()) {
+      if (!synth) {
         resolve(false);
         return;
       }
       try {
-        synth.cancel(); // never overlap two responses
-        const u = new SpeechSynthesisUtterance(String(text));
-        u.lang = document.documentElement.lang || navigator.language || "en-US";
-        u.rate = 1;
-        u.pitch = 1;
+        synth.cancel();
+        const u = new SpeechSynthesisUtterance(text);
+        u.lang = speechLang();
+        const voice = this._pickVoice();
+        if (voice) u.voice = voice;
+        u.rate = 1.0; // 0.95–1.05 sounds most conversational
+        u.pitch = 1.0;
         const done = (ok) => {
           if (this._utterance === u) {
-            this._speaking = false;
             this._utterance = null;
+            this._setSpeaking(false);
           }
           resolve(ok);
         };
         u.onend = () => done(true);
         u.onerror = () => done(false);
         this._utterance = u;
-        this._speaking = true;
+        this._setSpeaking(true);
         synth.speak(u);
       } catch {
-        this._speaking = false;
+        this._setSpeaking(false);
         resolve(false);
       }
     });
   }
 
+  _setSpeaking(speaking) {
+    if (this._speaking === speaking) return;
+    this._speaking = speaking;
+    this.onSpeakingStateChange?.(speaking);
+  }
+
   stopSpeaking() {
-    this._speaking = false;
+    const audio = this._audio;
+    this._audio = null;
+    if (audio) {
+      try {
+        audio.pause();
+        audio.src = "";
+      } catch {
+        /* already stopped */
+      }
+    }
     this._utterance = null;
     try {
       window.speechSynthesis?.cancel();
     } catch {
       /* unavailable */
     }
+    this._setSpeaking(false);
   }
 
   isSpeaking() {
     return this._speaking || Boolean(window.speechSynthesis?.speaking);
   }
 
-  /* ---------- shared controls ---------- */
+  /* ------------------------ shared controls ------------------------ */
 
-  /** Mute = stop recognizing. Unmuting does not auto-listen; demo decides. */
+  /** Mute = stop recognizing immediately. Unmuting does not auto-listen. */
   setMuted(muted) {
     this.muted = muted;
     if (muted) this.stopListening();
@@ -222,7 +382,7 @@ export class BrowserVoiceInput {
     if (this.onTranscript) this.onTranscript(text);
   }
 
-  /** Full teardown: recognition, TTS and any lingering mic tracks. */
+  /** Full teardown: recognition + all audio output. */
   stop() {
     this.stopListening();
     this.stopSpeaking();
@@ -233,8 +393,6 @@ export class BrowserVoiceInput {
     }
     this.recognition = null;
     this.listening = false;
-    this.stream?.getTracks().forEach((t) => t.stop());
-    this.stream = null;
   }
 }
 

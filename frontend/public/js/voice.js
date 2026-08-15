@@ -126,7 +126,21 @@ export class BrowserVoiceInput {
       return;
     }
     if (this.muted || this.listening) return;
-    if (this.isSpeaking()) return; // never listen while the AI is speaking
+    if (this.isSpeaking()) {
+      // Never listen while the AI is speaking — but do NOT silently drop the
+      // turn: retry briefly until playback state clears (bounded).
+      this._listenRetries = (this._listenRetries ?? 0) + 1;
+      if (this._listenRetries <= 20) {
+        setTimeout(() => {
+          if (!this.muted && !this.listening) this.startListening();
+        }, 250);
+      } else {
+        this._listenRetries = 0;
+        this.onError?.("silence");
+      }
+      return;
+    }
+    this._listenRetries = 0;
 
     const rec = new Ctor();
     this.recognition = rec;
@@ -138,7 +152,22 @@ export class BrowserVoiceInput {
 
     let finalText = "";
 
+    // Watchdog: if Chrome never fires onstart (rare silent failure), abort so
+    // onend runs and the bounded-restart/error path takes over — the UI must
+    // never claim "Listening…" while nothing is actually listening.
+    const startWatchdog = setTimeout(() => {
+      if (!this.listening && this.recognition === rec) {
+        dlog("recognition never started — aborting");
+        try {
+          rec.abort();
+        } catch {
+          /* already gone */
+        }
+      }
+    }, 3000);
+
     rec.onstart = () => {
+      clearTimeout(startWatchdog);
       this.listening = true;
       dlog("recognition started, lang =", rec.lang);
       this.onListeningStateChange?.(true);
@@ -171,6 +200,7 @@ export class BrowserVoiceInput {
     };
 
     rec.onend = () => {
+      clearTimeout(startWatchdog);
       this.listening = false;
       this.recognition = null;
       this.onListeningStateChange?.(false);
@@ -320,7 +350,12 @@ export class BrowserVoiceInput {
         if (voice) u.voice = voice;
         u.rate = 1.0; // 0.95–1.05 sounds most conversational
         u.pitch = 1.0;
+        let settled = false;
+        let watchdog = null;
         const done = (ok) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(watchdog);
           if (this._utterance === u) {
             this._utterance = null;
             this._setSpeaking(false);
@@ -329,9 +364,32 @@ export class BrowserVoiceInput {
         };
         u.onend = () => done(true);
         u.onerror = () => done(false);
+        // Chrome bug: onend/onerror sometimes never fire (esp. right after
+        // cancel()) — a watchdog guarantees speak() ALWAYS resolves so the
+        // conversation loop can never hang on "Speaking…".
+        const maxMs = Math.min(45000, 4000 + text.length * 90);
+        watchdog = setTimeout(() => {
+          dlog("speechSynthesis watchdog fired — forcing turn to continue");
+          try {
+            synth.cancel();
+          } catch {
+            /* unavailable */
+          }
+          done(false);
+        }, maxMs);
         this._utterance = u;
         this._setSpeaking(true);
-        synth.speak(u);
+        // Chrome bug: speak() immediately after cancel() can silently drop
+        // the utterance — queue on a short delay and resume() a paused engine.
+        setTimeout(() => {
+          if (settled) return;
+          try {
+            synth.speak(u);
+            synth.resume();
+          } catch {
+            done(false);
+          }
+        }, 60);
       } catch {
         this._setSpeaking(false);
         resolve(false);
@@ -366,7 +424,10 @@ export class BrowserVoiceInput {
   }
 
   isSpeaking() {
-    return this._speaking || Boolean(window.speechSynthesis?.speaking);
+    // ONLY our internally tracked state. Chrome's speechSynthesis.speaking
+    // flag can remain stuck true after an utterance ends, which would
+    // permanently block startListening() (mic appears dead).
+    return this._speaking;
   }
 
   /* ------------------------ shared controls ------------------------ */

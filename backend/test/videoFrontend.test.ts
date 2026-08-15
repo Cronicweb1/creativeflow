@@ -22,7 +22,7 @@ import { fileURLToPath } from "node:url";
 import { resolve, dirname } from "node:path";
 
 // @ts-ignore - plain browser ES module, DOM-free at import time
-import { createVideoTracker } from "../../frontend/public/js/videoStatus.js";
+import { createVideoTracker, saveActiveJob, loadActiveJob, clearActiveJob } from "../../frontend/public/js/videoStatus.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const SERVER = resolve(ROOT, "backend/src/server.ts");
@@ -234,4 +234,187 @@ test("backend: /api/video/session lookup + duplicate generate is idempotent", as
     proc.kill("SIGKILL");
     await once(proc, "exit").catch(() => {});
   }
+});
+
+/* ------------------------------------------------------------------ */
+/* Final integration additions: retry, refresh persistence, MCP parse  */
+/* ------------------------------------------------------------------ */
+
+test("tracker: explicit retry after failure starts exactly one new job", async () => {
+  let generates = 0;
+  let fail = true;
+  const fetchJson = async (method: string, path: string) => {
+    if (path.startsWith("/api/video/session/")) throw new Error("404");
+    if (path === "/api/video/generate") {
+      generates += 1;
+      return { status: "generating", jobId: `job-${generates}` };
+    }
+    if (path.startsWith("/api/video/status/")) {
+      return fail
+        ? { status: "failed", jobId: "job-1", error: "boom" }
+        : { status: "completed", jobId: "job-2", videoUrl: "https://cdn/x.mp4", downloadUrl: "https://cdn/x.mp4" };
+    }
+    throw new Error(`unexpected ${method} ${path}`);
+  };
+  const tracker = createVideoTracker({
+    fetchJson,
+    discoverAttempts: 1,
+    discoverDelayMs: 0,
+    intervalMs: 0,
+    delay: async () => {},
+  });
+  const first = await tracker.track({ sessionId: "s-retry", productionBrief: { product: "x" } });
+  assert.equal(first.phase, "failed");
+  assert.equal(generates, 1); // no automatic re-generation
+
+  fail = false;
+  const second = await tracker.retry("s-retry");
+  assert.equal(second.phase, "completed");
+  assert.equal(second.videoUrl, "https://cdn/x.mp4");
+  assert.equal(generates, 2); // exactly one more job, only on explicit retry
+});
+
+test("tracker: retry while still generating returns the in-flight run (no new job)", async () => {
+  let generates = 0;
+  let resolveStatus: (v: unknown) => void = () => {};
+  const gate = new Promise((r) => (resolveStatus = r));
+  const fetchJson = async (_m: string, path: string) => {
+    if (path.startsWith("/api/video/session/")) throw new Error("404");
+    if (path === "/api/video/generate") {
+      generates += 1;
+      return { status: "generating", jobId: "job-a" };
+    }
+    await gate;
+    return { status: "completed", jobId: "job-a", videoUrl: "https://cdn/a.mp4" };
+  };
+  const tracker = createVideoTracker({
+    fetchJson,
+    discoverAttempts: 1,
+    discoverDelayMs: 0,
+    intervalMs: 0,
+    delay: async () => {},
+  });
+  const p1 = tracker.track({ sessionId: "s-busy", productionBrief: { a: 1 } });
+  await new Promise((r) => setTimeout(r, 10));
+  const p2 = tracker.retry("s-busy");
+  resolveStatus(null);
+  const [r1, r2] = await Promise.all([p1, p2]);
+  assert.equal(r1.phase, "completed");
+  assert.equal(r2.phase, "completed");
+  assert.equal(generates, 1); // retry did NOT duplicate the running job
+});
+
+test("persistence: save/load round-trip and stale-job rejection", () => {
+  const store = new Map<string, string>();
+  const storage = {
+    getItem: (k: string) => store.get(k) ?? null,
+    setItem: (k: string, v: string) => void store.set(k, v),
+    removeItem: (k: string) => void store.delete(k),
+  };
+  saveActiveJob(storage, { sessionId: "s1", jobId: "vid-1" }, 1000);
+  const fresh = loadActiveJob(storage, 600000, 5000);
+  assert.deepEqual({ sessionId: fresh.sessionId, jobId: fresh.jobId }, { sessionId: "s1", jobId: "vid-1" });
+  // 10-minute-old jobs are stale — a refresh must not resume them.
+  assert.equal(loadActiveJob(storage, 600000, 1000 + 600001), null);
+  clearActiveJob(storage);
+  assert.equal(loadActiveJob(storage, 600000, 5000), null);
+  // corrupt payloads never throw
+  storage.setItem("cf_video_job", "{not json");
+  assert.equal(loadActiveJob(storage, 600000, 5000), null);
+});
+
+test("tracker: resume by jobId polls without creating a job", async () => {
+  const calls: string[] = [];
+  const fetchJson = async (_m: string, path: string) => {
+    calls.push(path);
+    if (path === "/api/video/status/vid-resume") {
+      return { status: "completed", jobId: "vid-resume", videoUrl: "https://cdn/r.mp4", downloadUrl: "https://cdn/r.mp4" };
+    }
+    throw new Error(`unexpected ${path}`);
+  };
+  const tracker = createVideoTracker({ fetchJson, intervalMs: 0, delay: async () => {} });
+  const final = await tracker.track({ sessionId: "s-resume", jobId: "vid-resume" });
+  assert.equal(final.phase, "completed");
+  assert.ok(!calls.includes("/api/video/generate")); // resume never re-generates
+  assert.ok(!calls.some((c) => c.startsWith("/api/video/session/"))); // no discovery needed
+});
+
+test("mcp: parseSseJson extracts the last JSON data frame", async () => {
+  const { parseSseJson } = await import("../src/services/videoService.ts");
+  const sse = [
+    "event: message",
+    'data: {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\\"successful\\":true}"}]}}',
+    "",
+    "data: keep-alive",
+    "",
+  ].join("\n");
+  const parsed = parseSseJson(sse) as { result?: { content?: Array<{ text?: string }> } };
+  assert.equal(parsed?.result?.content?.[0]?.text, '{"successful":true}');
+  assert.equal(parseSseJson("no data lines here"), null);
+});
+
+test("mcp: ComposioVeoVideoService full flow over a fake MCP server (SSE), no key leak", async (t) => {
+  const { createServer } = await import("node:http");
+  const { ComposioVeoVideoService } = await import("../src/services/videoService.ts");
+  const MCP_PORT = 3991;
+  const KEY = "ck_test_mcp_secret_do_not_leak";
+  const seen: { headers: string[]; methods: string[] } = { headers: [], methods: [] };
+
+  const server = createServer((req, res) => {
+    seen.headers.push(String(req.headers["x-consumer-api-key"] ?? ""));
+    let raw = "";
+    req.on("data", (c) => (raw += c));
+    req.on("end", () => {
+      const body = JSON.parse(raw || "{}");
+      seen.methods.push(body.method);
+      res.setHeader("mcp-session-id", "mcp-sess-1");
+      if (body.method === "initialize") {
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { protocolVersion: "2025-03-26" } }));
+        return;
+      }
+      if (body.method === "notifications/initialized") {
+        res.statusCode = 202;
+        res.end();
+        return;
+      }
+      // tools/call — answer as SSE, the Streamable-HTTP norm.
+      const tool = body.params?.name;
+      const inner =
+        tool === "GEMINI_GENERATE_VIDEOS"
+          ? { successful: true, data: { operation_name: "operations/mcp-op-1" } }
+          : { successful: true, data: { video_file: { s3url: "https://cdn.example/mcp-video.mp4" } } };
+      const rpc = {
+        jsonrpc: "2.0",
+        id: body.id,
+        result: { isError: false, content: [{ type: "text", text: JSON.stringify(inner) }] },
+      };
+      res.setHeader("content-type", "text/event-stream");
+      res.end(`event: message\ndata: ${JSON.stringify(rpc)}\n\n`);
+    });
+  });
+  server.listen(MCP_PORT);
+  t.after(() => server.close());
+
+  const svc = new ComposioVeoVideoService({
+    apiKey: KEY,
+    mcpUrl: `http://127.0.0.1:${MCP_PORT}/mcp`,
+  });
+  const job = svc.start("sess-mcp", { product: "smart bottle", visualStyle: "cinematic" });
+  assert.equal(job.status, "generating");
+  for (let i = 0; i < 100 && svc.get(job.jobId)!.status === "generating"; i++) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  const done = svc.get(job.jobId)!;
+  assert.equal(done.status, "completed");
+  assert.equal(done.videoUrl, "https://cdn.example/mcp-video.mp4");
+  assert.equal(done.downloadUrl, "https://cdn.example/mcp-video.mp4");
+  assert.ok(seen.headers.every((h) => h === KEY), "MCP auth uses x-consumer-api-key");
+  assert.deepEqual(seen.methods, [
+    "initialize",
+    "notifications/initialized",
+    "tools/call",
+    "tools/call",
+  ]);
+  assert.ok(!JSON.stringify(done).includes(KEY), "key never appears in job state");
 });

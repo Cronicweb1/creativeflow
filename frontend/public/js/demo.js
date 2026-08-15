@@ -372,9 +372,11 @@ export class DemoExperience {
               ? "No microphone was found — check your input device, or type your answers below."
               : reason === "network"
                 ? "Speech recognition needs a network connection — tap the mic to retry, or type below."
-                : reason === "silence"
-                  ? "Didn't catch anything — tap the mic to try again, or type your answer below."
-                  : "Speech recognition hit a snag — tap the mic to retry, or type your answers below.";
+                : reason === "language"
+                  ? "Speech recognition doesn't support English on this device — type your answers below."
+                  : reason === "silence"
+                    ? "Didn't catch anything — tap the mic to try again, or type your answer below."
+                    : "Speech recognition hit a snag — tap the mic to retry, or type your answers below.";
       this.setVoiceState("idle");
       this.showInterim("");
       this.setMicHint(message);
@@ -411,7 +413,9 @@ export class DemoExperience {
         await this.voice.speak(lastAgent.text); // resolves even if TTS unavailable
       }
       if (!this.session || this.wrappingUp) return;
-      this.setVoiceState("listening");
+      // Do NOT pre-claim "listening" — the status flips to "Listening…" only
+      // when recognition.onstart actually fires (via onListeningStateChange).
+      this.setVoiceState("idle");
       this.voice.startListening();
     });
     return this._turnChain;
@@ -419,8 +423,13 @@ export class DemoExperience {
 
   setVoiceState(state) {
     this.voiceState = state;
+    try {
+      if (window.__creativeFlowVoiceDebug) window.__creativeFlowVoiceDebug.processing = state === "thinking";
+    } catch {
+      /* diagnostics only */
+    }
     if (!this.voiceMode) return;
-    const label = { idle: "Ready", listening: "Listening…", thinking: "Thinking…", speaking: "Speaking…" }[state];
+    const label = { idle: "Tap mic to speak", listening: "Listening…", thinking: "Thinking…", speaking: "Speaking…" }[state];
     if (label) this.setStatus(label);
   }
 
@@ -443,18 +452,19 @@ export class DemoExperience {
       try {
         if (DEBUG) {
           // Payload log for development — no secrets are ever in this payload.
-          console.info("[CreativeFlow] /api/copilot/turn payload:", {
+          console.info("[voice] sending transcript to /api/copilot/turn", {
             sessionId: this.session.sessionId,
             userMessage: text,
           });
         }
         turn = await api.copilotTurn(this.session.sessionId, text);
+        if (DEBUG) console.info("[voice] Copilot response received");
       } catch {
         this.setStatus("Creative intelligence temporarily unavailable");
         this.setMicHint("Creative intelligence temporarily unavailable — please try again.");
         if (voiceMode && !this.voice.muted) {
           await pause(1200);
-          this.setVoiceState("listening");
+          this.setVoiceState("idle"); // "Listening…" only after onstart fires
           this.voice.startListening(); // allow retry by voice
         }
         return;
@@ -484,7 +494,7 @@ export class DemoExperience {
       }
 
       if (voiceMode && !this.voice.muted && !this.wrappingUp) {
-        this.setVoiceState("listening");
+        this.setVoiceState("idle"); // "Listening…" appears only after onstart
         this.voice.startListening(); // playback done — visitor may speak again
       } else if (voiceMode) {
         this.setVoiceState("idle");

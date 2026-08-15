@@ -19,7 +19,21 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 22.18.0
-      # ElevenLabs Agents — live browser voice conversation.
+      # Provider mode matrix — override in the dashboard when needed:
+      #   VOICE_PROVIDER: elevenlabs | simulation (credit-free typed demo)
+      #   COPILOT_PROVIDER: mock | live (live needs COPILOT_WORKFLOW_URL)
+      - key: VOICE_PROVIDER
+        sync: false
+      - key: COPILOT_PROVIDER
+        sync: false
+      # Copilot Studio brain (live mode) — set real values in the dashboard.
+      - key: COPILOT_WORKFLOW_URL
+        sync: false
+      - key: COPILOT_AUTH_TOKEN
+        sync: false
+      - key: COPILOT_LLM_API_KEY
+        sync: false
+      # ElevenLabs Agents — voice/audio transport.
       # Set the real values in the Render dashboard:
       #   creativeflow → Environment → Add Environment Variable
       # They stay server-side and are never exposed to the browser.

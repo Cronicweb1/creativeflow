@@ -27,6 +27,10 @@ export const api = {
   health: () => request("GET", "/api/health"),
   startSession: () => request("POST", "/api/demo/session"),
   sendMessage: (sessionId, text) => request("POST", "/api/demo/message", { sessionId, text }),
+  // Copilot bridge — the conversational brain lives behind the backend.
+  copilotTurn: (sessionId, userMessage) =>
+    request("POST", "/api/copilot/turn", { sessionId, userMessage }),
+  copilotState: (sessionId) => request("GET", `/api/copilot/state/${sessionId}`),
   buildBrief: (sessionId) => request("POST", "/api/brief/build", { sessionId }),
   confirmBrief: (briefId) => request("POST", "/api/brief/confirm", { briefId }),
   reopenSession: (sessionId) => request("POST", "/api/brief/reopen", { sessionId }),

@@ -7,10 +7,12 @@ import { registerBriefRoutes } from "./routes/brief.ts";
 import { registerProductionRoutes } from "./routes/production.ts";
 import { registerCopilotRoutes } from "./routes/copilot.ts";
 import { registerTtsRoutes, ttsProviderName } from "./routes/tts.ts";
+import { registerVideoRoutes } from "./routes/video.ts";
 import { conversationService } from "./services/conversationService.ts";
 import { briefService } from "./services/briefService.ts";
 import { productionService } from "./services/productionService.ts";
 import { copilotProviderName, createCopilotProvider } from "./services/copilotService.ts";
+import { createVideoService, videoProviderName } from "./services/videoService.ts";
 
 /**
  * CreativeFlow API + static host.
@@ -36,6 +38,7 @@ const PORT = Number(process.env.PORT ?? 3000);
 
 const router = new Router(STATIC_ROOT);
 const copilotProvider = createCopilotProvider(conversationService);
+const videoService = createVideoService();
 
 /**
  * "browser"     — default: free Web Speech API voice in the client
@@ -55,6 +58,7 @@ router.get("/api/health", ({ res }) => {
     voice: voiceProviderName(),
     tts: ttsProviderName(),
     copilot: copilotProviderName(),
+    video: videoProviderName(),
     time: new Date().toISOString(),
   });
 });
@@ -64,6 +68,7 @@ registerBriefRoutes(router, briefService, conversationService);
 registerProductionRoutes(router, productionService, briefService);
 registerCopilotRoutes(router, copilotProvider, conversationService);
 registerTtsRoutes(router);
+registerVideoRoutes(router, videoService);
 
 const server = createServer((req, res) => {
   void router.dispatch(req, res);
@@ -73,6 +78,6 @@ server.listen(PORT, () => {
   console.log(`CreativeFlow listening on http://localhost:${PORT}`);
   console.log(`Static root: ${STATIC_ROOT}`);
   console.log(
-    `Providers — voice: ${voiceProviderName()} · tts: ${ttsProviderName()} · copilot: ${copilotProviderName()}`,
+    `Providers — voice: ${voiceProviderName()} · tts: ${ttsProviderName()} · copilot: ${copilotProviderName()} · video: ${videoProviderName()}`,
   );
 });

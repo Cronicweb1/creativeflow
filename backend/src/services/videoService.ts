@@ -138,7 +138,7 @@ abstract class BaseVideoService implements VideoService {
     this.jobs.set(job.jobId, job);
     // Fire and forget — never block the HTTP request.
     void this.run(job, productionBrief).catch((err: unknown) => {
-      this.fail(job, err instanceof Error ? err.message : "video_generation_failed");
+      this.fail(job, errorText(err));
     });
     return job;
   }
@@ -163,9 +163,25 @@ abstract class BaseVideoService implements VideoService {
   protected abstract run(job: VideoJob, brief: Record<string, unknown>): Promise<void>;
 }
 
+/** Coerce any thrown/returned error shape (string, Error, object) to text. */
+export function errorText(err: unknown): string {
+  if (typeof err === "string") return err;
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === "object") {
+    const m = (err as Record<string, unknown>).message;
+    if (typeof m === "string" && m) return m;
+    try {
+      return JSON.stringify(err).slice(0, 500);
+    } catch {
+      return "video_generation_failed";
+    }
+  }
+  return "video_generation_failed";
+}
+
 /** Never let credentials or auth headers leak into stored error strings. */
-function sanitizeError(message: string): string {
-  return message
+function sanitizeError(message: unknown): string {
+  return errorText(message)
     .replace(/(x-api-key|api[_-]?key|bearer)\s*[:=]\s*\S+/gi, "$1: [redacted]")
     .slice(0, 500);
 }
@@ -200,7 +216,7 @@ export class MockVideoService extends BaseVideoService {
 
 interface ComposioExecuteResponse {
   successful?: boolean;
-  error?: string | null;
+  error?: unknown;
   data?: Record<string, unknown>;
 }
 
@@ -251,7 +267,7 @@ export class ComposioVeoVideoService extends BaseVideoService {
     }
     if (!res.ok) {
       throw new Error(
-        `composio_${toolSlug.toLowerCase()}_http_${res.status}: ${sanitizeError((json?.error as string) ?? text ?? "").slice(0, 200)}`,
+        `composio_${toolSlug.toLowerCase()}_http_${res.status}: ${sanitizeError(json?.error ?? text ?? "").slice(0, 200)}`,
       );
     }
     if (!json) throw new Error(`composio_${toolSlug.toLowerCase()}_invalid_response`);
@@ -271,7 +287,7 @@ export class ComposioVeoVideoService extends BaseVideoService {
       this.generateTimeoutMs,
     );
     if (gen.successful === false) {
-      this.fail(job, gen.error ?? "veo_generate_failed");
+      this.fail(job, gen.error ? errorText(gen.error) : "veo_generate_failed");
       return;
     }
     const operationName = gen.data?.operation_name;
@@ -288,7 +304,7 @@ export class ComposioVeoVideoService extends BaseVideoService {
       this.waitTimeoutMs,
     );
     if (wait.successful === false) {
-      this.fail(job, wait.error ?? "veo_wait_failed");
+      this.fail(job, wait.error ? errorText(wait.error) : "veo_wait_failed");
       return;
     }
     const data = wait.data ?? {};

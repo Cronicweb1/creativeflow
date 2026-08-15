@@ -1,90 +1,91 @@
 # CreativeFlow
 
-**AI Creative Client-to-Production Showcase**
+AI creative client-to-production showcase. A visitor talks to an AI
+Creative Director, a structured creative brief is built live, and — after
+explicit confirmation — production is kicked off (currently simulated).
 
-An interactive portfolio showcase of an AI creative agency workflow:
+Zero runtime dependencies: plain Node (>= 22.18) runs the TypeScript
+backend natively (type stripping), which serves both the API and the
+vanilla-JS frontend. No build step.
 
-```
-Client conversation → requirement understanding → creative brief → AI production → final video
-```
-
-## Layered architecture — one brain, one voice
-
-```
-CLIENT (browser microphone)
-   ↓
-ElevenLabs Agents (WebRTC)      — voice/audio transport ONLY: ASR + TTS
-   ↓  each turn via Custom LLM
-Render Node backend             — secure bridge + session/state layer
-   ↓
-Copilot Studio                  — conversational intelligence: decides every
-   ↓                              reply + owns the structured Creative Brief
-Render Node backend
-   ↓
-ElevenLabs → AI voice → CLIENT
-```
-
-After the client explicitly confirms the brief (a separate step — never automatic):
+## Layered architecture — one brain, free voice
 
 ```
-Confirmed brief → production workflow → n8n / Composio → Gemini / Veo → video → CreativeFlow
-(video generation is still SIMULATED — the production provider seam is ready)
+CLIENT (browser)
+  ├── microphone → Web Speech API SpeechRecognition   (STT — free, local)
+  ├── POST /api/copilot/turn                          (transcript → backend)
+  │        └── Render Node backend (bridge + session/state)
+  │                 └── Activepieces /sync workflow → Groq   (the ONLY brain)
+  ├── structured response {responseText, requirements, missing, complete, …}
+  │        └── Live Creative Brief UI (authoritative state from the brain)
+  └── window.speechSynthesis speaks responseText      (TTS — free, local)
+           └── back to listening
 ```
 
-ElevenLabs does **not** independently answer the client. The agent's LLM is replaced by a
-**Custom LLM** pointing at this backend, which forwards every turn to Copilot. There is exactly
-one conversational brain and one spoken response per turn.
+- **Browser Web Speech API** — the entire voice layer. Free, native,
+  no credits, no external voice provider. Browsers without
+  SpeechRecognition automatically fall back to the typed text simulation.
+- **Activepieces → Groq** — the single conversational intelligence,
+  reached synchronously through `COPILOT_WORKFLOW_URL`.
+- **Render Node backend** — secure bridge; owns sessions, state, and the
+  creative brief. Credentials never reach the browser.
+- **n8n / Composio → Gemini / Veo** — downstream production (still
+  simulated; interface prepared).
+
+> The former **ElevenLabs Conversational AI agent is retired** — it
+> consumed credits too quickly. Its token route is no longer registered
+> (`/api/elevenlabs/token` → 404) and no agent session is ever created.
+> `backend/src/routes/elevenlabs.ts` is kept only as unregistered,
+> isolated dead code.
 
 ## Run it
-
-Requires **Node ≥ 22.18** (native TypeScript type stripping — no build step, no dependencies).
 
 ```bash
 node backend/src/server.ts
 # → http://localhost:3000
 ```
 
-Dev mode with reload: `npm run dev` · Type-check (needs dev deps): `npm run typecheck` · API tests: `npm test`
+Tests: `npm test` (node --test, boots the real server).
 
-## Provider mode matrix (test without consuming credits)
+## Provider mode matrix
 
-| `VOICE_PROVIDER` | `COPILOT_PROVIDER` | Result |
+| VOICE_PROVIDER | COPILOT_PROVIDER | Result |
 | --- | --- | --- |
-| `simulation` (or EL vars unset) | `mock` (default) | Typed demo, deterministic intake — zero external calls |
-| `simulation` | `live` | Typed demo, real Copilot brain |
-| `elevenlabs` (default when EL vars set) | `mock` | Real voice, deterministic brain |
-| `elevenlabs` | `live` | Full production architecture |
+| `browser` (default) | `mock` | Free spoken demo, deterministic local brain |
+| `browser` (default) | `live` | Free spoken demo, Activepieces/Groq brain |
+| `simulation` | `mock` | Typed demo, fully offline |
+| `simulation` | `live` | Typed demo, Activepieces/Groq brain |
+
+Voice never consumes credits in any combination.
 
 ## Environment variables
 
-Set real values in **Render Dashboard → creativeflow → Environment** — never in Git.
-
 | Variable | Purpose |
 | --- | --- |
-| `VOICE_PROVIDER` | `elevenlabs` \| `simulation` (credit-free typed mode) |
-| `COPILOT_PROVIDER` | `mock` (default) \| `live` |
-| `COPILOT_WORKFLOW_URL` | Synchronous Copilot Studio HTTP workflow endpoint (live mode) |
-| `COPILOT_AUTH_TOKEN` | Optional `Authorization: Bearer` token for that workflow |
-| `COPILOT_LLM_API_KEY` | Optional shared secret for the ElevenLabs Custom-LLM endpoint |
-| `ELEVENLABS_API_KEY` | Secret `sk_…` API key. Server-only. |
-| `ELEVENLABS_AGENT_ID` | ElevenLabs agent id. Server-side. |
-| `GEMINI_API_KEY`, `COMPOSIO_API_KEY` | Future production integrations (still mocked) |
+| `PORT` | HTTP port (Render sets it) |
+| `VOICE_PROVIDER` | `browser` (default) or `simulation` |
+| `COPILOT_PROVIDER` | `mock` (default) or `live` |
+| `COPILOT_WORKFLOW_URL` | Activepieces `/sync` webhook URL (live brain) |
+| `COPILOT_AUTH_TOKEN` | Optional `Authorization: Bearer` for the workflow |
+| `COPILOT_LLM_API_KEY` | Optional secret for the OpenAI-compatible endpoint |
+| `GEMINI_API_KEY`, `COMPOSIO_API_KEY` | Future production pipeline (still mocked) |
+| ~~`ELEVENLABS_API_KEY`, `ELEVENLABS_AGENT_ID`~~ | Retired — unused, safe to delete |
 
-## Copilot Studio workflow contract
+## Workflow contract (live brain)
 
-The backend POSTs each turn to `COPILOT_WORKFLOW_URL` (synchronous — e.g. a Power Automate
-“When an HTTP request is received” flow with a **Response** action, called from your Copilot
-Studio agent). Request:
+`POST $COPILOT_WORKFLOW_URL` receives:
 
 ```json
 {
-  "sessionId": "creativeflow-session-id",
+  "sessionId": "…",
   "userMessage": "We're launching a premium skincare serum.",
-  "conversationState": { "client": null, "product": null, "platform": null, "...": null }
+  "conversationState": { "client": null, "product": null, "campaign": null,
+    "platform": null, "contentType": null, "visualStyle": null,
+    "audience": null, "duration": null, "aspectRatio": null }
 }
 ```
 
-Required machine-readable response:
+and must synchronously return:
 
 ```json
 {
@@ -97,68 +98,32 @@ Required machine-readable response:
 }
 ```
 
-`readyForProduction` must only become `true` after the client **explicitly confirms** the
-summarized brief — a filled brief is not an approved brief. On Copilot failure the backend
-returns the controlled fallback (“Sorry, I had a brief connection issue…”) — no second AI
-ever invents a reply.
-
-## ElevenLabs agent configuration (dashboard)
-
-1. **Agent → LLM → Custom LLM**:
-   - Server URL: `https://creativeflow.onrender.com/api/copilot/llm/v1`
-   - Model ID: `creativeflow-copilot`
-   - API key: the value of `COPILOT_LLM_API_KEY` (if set)
-2. Enable the **Custom LLM extra body** option so the browser-supplied
-   `{ sessionId }` reaches the backend (sent by `voice.js` as `customLlmExtraBody`).
-3. Keep the agent's first message static (a greeting); every subsequent reply is
-   generated by Copilot through the bridge.
-4. Security → enable auth; allowlist your domains. The browser gets a short-lived
-   token from `GET /api/elevenlabs/token` — the API key never leaves the server.
+`readyForProduction` may only become `true` after the client explicitly
+confirms the summarized brief — never automatically.
 
 ## API
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `POST` | `/api/demo/session` | Start a call session |
-| `GET` | `/api/demo/session/:id` | Fetch session state |
-| `POST` | `/api/demo/message` | Legacy direct utterance endpoint |
-| `POST` | `/api/copilot/turn` | One conversational turn through the Copilot brain |
-| `GET` | `/api/copilot/state/:sessionId` | Authoritative Live-Brief state |
-| `POST` | `/api/copilot/llm/v1/chat/completions` | OpenAI-compatible endpoint for the ElevenLabs Custom LLM (SSE) |
-| `GET` | `/api/elevenlabs/token` | Mint a short-lived ElevenLabs conversation token |
-| `POST` | `/api/brief/build` | Build a brief from a completed conversation |
-| `POST` | `/api/brief/confirm` | Client approves the brief |
-| `POST` | `/api/brief/reopen` | Client wants changes; conversation reopens |
-| `GET` | `/api/brief/:id` | Fetch a brief |
-| `POST` | `/api/production/start` | Start production for a confirmed brief |
-| `GET` | `/api/production/:id` | Poll job state (stages, assets, summary) |
-| `GET` | `/api/health` | Health + `voice` + `copilot` provider status |
+| Route | Purpose |
+| --- | --- |
+| `GET /api/health` | status + active providers (`voice`, `copilot`) |
+| `POST /api/demo/session` | create the demo session (real session ids) |
+| `POST /api/copilot/turn` | one conversational turn `{sessionId, userMessage}` |
+| `GET /api/copilot/state/:sessionId` | authoritative brief/requirement state |
+| `POST /api/copilot/llm/v1/chat/completions` | OpenAI-compatible SSE bridge (optional) |
+| `POST /api/brief/build` · `/confirm` · `/reopen` | brief lifecycle |
+| `POST /api/production/start` · `GET /api/production/:id` | simulated production |
 
 ## Layout
 
 ```
-backend/
-  src/
-    routes/        demo.ts · brief.ts · production.ts · elevenlabs.ts · copilot.ts
-    services/      conversationService.ts · briefService.ts · productionService.ts · copilotService.ts
-    types/         creative.ts · conversation.ts
-    mock/          conversation.ts · production.ts   ← only the mock layer touches these
-    lib/           router.ts (dependency-free HTTP router + static host)
-    server.ts
-  test/            api.test.ts (node --test, full journey)
-frontend/
-  public/
-    index.html
-    styles/main.css
-    js/            app.js · demo.js · api.js · voice.js · preview.js
-render.yaml
-.env.example
+backend/src/{routes,services,types,mock,lib}   dependency-free TS backend
+backend/test/                                  node --test e2e + voice tests
+frontend/public/{js,styles}                    vanilla JS modules, no build
+render.yaml                                    single Render web service
 ```
 
 ## What is intentionally not connected yet
 
-Gemini · Veo · Composio · n8n production execution.
-
-Video generation remains **simulated** (`MockProductionService`). The confirmed brief is already
-exported as structured JSON (`buildProductionPayload`) ready for the future
-n8n / Composio → Gemini / Veo workflow.
+Real video generation (Composio → Gemini/Veo). The production pipeline is
+simulated end-to-end; `buildProductionPayload()` already emits the
+structured JSON brief the downstream workflow will consume.

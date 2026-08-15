@@ -7,6 +7,7 @@ import { registerBriefRoutes } from "./routes/brief.ts";
 import { registerProductionRoutes } from "./routes/production.ts";
 import { registerCopilotRoutes } from "./routes/copilot.ts";
 import { registerTtsRoutes, ttsProviderName } from "./routes/tts.ts";
+import { registerTranscribeRoutes, sttProviderName } from "./routes/transcribe.ts";
 import { registerVideoRoutes } from "./routes/video.ts";
 import { conversationService } from "./services/conversationService.ts";
 import { briefService } from "./services/briefService.ts";
@@ -29,6 +30,7 @@ import { createVideoService, videoProviderName } from "./services/videoService.t
  * Provider credentials come from the environment and are never exposed
  * to the browser:
  *   COPILOT_WORKFLOW_URL, COPILOT_AUTH_TOKEN — Activepieces /sync → Groq brain (live mode)
+ *   GROQ_API_KEY                             — server-side Whisper STT (/api/voice/transcribe)
  *   GEMINI_API_KEY, COMPOSIO_API_KEY         — production pipeline (still mocked)
  */
 
@@ -57,6 +59,7 @@ router.get("/api/health", ({ res }) => {
     mode: "simulation", // becomes "production" once real generation providers are wired in
     voice: voiceProviderName(),
     tts: ttsProviderName(),
+    stt: sttProviderName(),
     copilot: copilotProviderName(),
     video: videoProviderName(),
     time: new Date().toISOString(),
@@ -68,6 +71,7 @@ registerBriefRoutes(router, briefService, conversationService);
 registerProductionRoutes(router, productionService, briefService);
 registerCopilotRoutes(router, copilotProvider, conversationService);
 registerTtsRoutes(router);
+registerTranscribeRoutes(router);
 registerVideoRoutes(router, videoService);
 
 const server = createServer((req, res) => {

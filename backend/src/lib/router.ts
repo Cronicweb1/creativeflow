@@ -93,7 +93,13 @@ export class Router {
       if (route.method !== req.method) continue;
       const params = matchSegments(route.segments, pathSegments);
       if (!params) continue;
-      const body = req.method === "POST" ? await readJsonBody(req) : {};
+      // multipart bodies (audio uploads) are streamed by their handler —
+      // only JSON bodies are parsed here.
+      const contentType = String(req.headers["content-type"] ?? "").toLowerCase();
+      const body =
+        req.method === "POST" && !contentType.startsWith("multipart/")
+          ? await readJsonBody(req)
+          : {};
       if (body === null) return sendError(res, 400, "invalid_json");
       try {
         await route.handler({ req, res, params, body });

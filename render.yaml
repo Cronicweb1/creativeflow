@@ -1,0 +1,30 @@
+# Render blueprint for CreativeFlow.
+#
+# Single web service: the Node backend serves both the API (/api/*) and the
+# static frontend (frontend/public). No build step is required — the backend
+# is dependency-free TypeScript executed natively by Node >= 22.18.
+#
+# If the frontend is ever split into its own static site, set
+# window.CREATIVEFLOW_API_URL in frontend/public/js/config.js (see
+# frontend/README notes) to point at this service's URL.
+
+services:
+  - type: web
+    name: creativeflow
+    runtime: node
+    plan: free
+    buildCommand: "echo 'no build step — native TypeScript'"
+    startCommand: "node backend/src/server.ts"
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 22.18.0
+      # Provider keys for future integrations. Set real values in the
+      # Render dashboard; they stay server-side and are never exposed
+      # to the browser.
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: COMPOSIO_API_KEY
+        sync: false
+      - key: VOICE_AGENT_API_KEY
+        sync: false

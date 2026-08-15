@@ -34,9 +34,24 @@ services:
         sync: false
       - key: COPILOT_LLM_API_KEY
         sync: false
-      # NOTE: ELEVENLABS_API_KEY / ELEVENLABS_AGENT_ID are retired — the
-      # conversational agent was removed from the voice loop and the token
-      # route is unregistered. The vars can be deleted from the dashboard.
+      # Natural TTS (POST /api/tts). Keys stay server-side — the browser
+      # never sees them. Auto-detects elevenlabs when ELEVENLABS_API_KEY is
+      # set (plain text-to-speech endpoint ONLY — the conversational agent
+      # stays retired; ELEVENLABS_AGENT_ID is unused and can be deleted).
+      - key: TTS_PROVIDER
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: TTS_VOICE_ID
+        sync: false
+      - key: TTS_MODEL
+        sync: false
+      - key: TTS_API_URL
+        sync: false
+      - key: TTS_API_KEY
+        sync: false
+      - key: TTS_VOICE
+        sync: false
       # Provider keys for future integrations. Set real values in the
       # Render dashboard; they stay server-side and are never exposed
       # to the browser.

@@ -1,21 +1,29 @@
 /**
  * Voice layer — real browser voice conversation via ElevenLabs Agents.
  *
- * BrowserVoiceInput streams the visitor's microphone to an ElevenLabs
- * agent over WebRTC and plays the agent's spoken replies in the browser.
+ * ElevenLabs is the AUDIO layer only: microphone transport, speech
+ * recognition, speech output and the realtime WebRTC session. The
+ * conversational intelligence is Copilot Studio — the ElevenLabs agent is
+ * configured with a Custom LLM pointing at this backend
+ * (/api/copilot/llm/v1), which bridges every turn to Copilot. ElevenLabs
+ * never independently decides what to say.
+ *
  * The temporary conversation token is fetched from the CreativeFlow
  * backend (/api/elevenlabs/token) so the ElevenLabs API key never
  * reaches the client.
  *
- * The class keeps the same surface demo.js has always used
- * (requestPermission / onTranscript / setMuted / stop) and adds
- * agent-side events so the call UI can reflect the real session state:
+ * Surface used by demo.js:
  *
+ *   requestPermission()       — mic permission pre-flight
+ *   connect({ sessionId })    — open the WebRTC session, tagged with the
+ *                               CreativeFlow session so the backend bridge
+ *                               can map spoken turns to session state
  *   onTranscript(text)        — final visitor utterance (from ElevenLabs ASR)
  *   onAgentTranscript(text)   — agent reply text (spoken audio is played by the SDK)
  *   onStatus(status)          — "connecting" | "connected" | "disconnected"
  *   onMode(mode)              — "speaking" | "listening"
  *   onError(message)          — human-readable failure reason
+ *   setMuted(bool) / stop()   — real mute / real teardown
  *
  * SimulatedVoiceInput is kept below purely as a typed fallback/debug path.
  */
@@ -52,8 +60,13 @@ export class BrowserVoiceInput {
    * Connect to the ElevenLabs agent: fetch a temporary conversation token
    * from the backend, then open the WebRTC session. Resolves once connected;
    * throws with a human-readable message on failure.
+   *
+   * options.sessionId — the CreativeFlow session id. Passed to ElevenLabs as
+   * a dynamic variable and custom-LLM extra body so the backend bridge can
+   * route each turn to the right Copilot conversation state.
    */
-  async connect() {
+  async connect(options = {}) {
+    const { sessionId } = options;
     this.onStatus?.("connecting");
 
     // 1. Temporary conversation token from our backend (API key stays server-side).
@@ -84,11 +97,17 @@ export class BrowserVoiceInput {
     this.stream?.getTracks().forEach((t) => t.stop());
     this.stream = null;
 
-    // 4. Start the WebRTC conversation.
+    // 4. Start the WebRTC conversation (exactly one per CreativeFlow session).
     try {
       this.conversation = await Conversation.startSession({
         conversationToken: token,
         connectionType: "webrtc",
+        ...(sessionId
+          ? {
+              dynamicVariables: { session_id: sessionId },
+              customLlmExtraBody: { sessionId },
+            }
+          : {}),
         onConnect: () => this.onStatus?.("connected"),
         onDisconnect: () => this.onStatus?.("disconnected"),
         onError: (message) => this._fail(typeof message === "string" ? message : "Voice connection error"),
@@ -164,8 +183,9 @@ function tokenErrorMessage(code, status) {
 }
 
 /**
- * Typed simulation — retained ONLY as a debug fallback (no audio, no agent).
- * Not used by the demo flow unless explicitly constructed.
+ * Typed simulation — no audio, no ElevenLabs session, no credits consumed.
+ * Used when VOICE_PROVIDER=simulation (or ElevenLabs is unconfigured): the
+ * visitor types, the Copilot bridge (/api/copilot/turn) answers with text.
  */
 export class SimulatedVoiceInput {
   constructor() {

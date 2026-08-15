@@ -8,11 +8,32 @@ An interactive portfolio showcase of an AI creative agency workflow:
 Client conversation → requirement understanding → creative brief → AI production → final video
 ```
 
-The client conversation is a **real browser voice call**: the visitor speaks through their
-microphone to an **ElevenLabs Agents** voice agent (WebRTC) and hears it answer. The structured
-workflow — requirement extraction, live creative brief, brief confirmation and the production
-pipeline — runs on the CreativeFlow backend. Gemini/Veo generation and Composio/MCP tooling still
-plug in later as service-level replacements.
+## Layered architecture — one brain, one voice
+
+```
+CLIENT (browser microphone)
+   ↓
+ElevenLabs Agents (WebRTC)      — voice/audio transport ONLY: ASR + TTS
+   ↓  each turn via Custom LLM
+Render Node backend             — secure bridge + session/state layer
+   ↓
+Copilot Studio                  — conversational intelligence: decides every
+   ↓                              reply + owns the structured Creative Brief
+Render Node backend
+   ↓
+ElevenLabs → AI voice → CLIENT
+```
+
+After the client explicitly confirms the brief (a separate step — never automatic):
+
+```
+Confirmed brief → production workflow → n8n / Composio → Gemini / Veo → video → CreativeFlow
+(video generation is still SIMULATED — the production provider seam is ready)
+```
+
+ElevenLabs does **not** independently answer the client. The agent's LLM is replaced by a
+**Custom LLM** pointing at this backend, which forwards every turn to Copilot. There is exactly
+one conversational brain and one spoken response per turn.
 
 ## Run it
 
@@ -25,102 +46,74 @@ node backend/src/server.ts
 
 Dev mode with reload: `npm run dev` · Type-check (needs dev deps): `npm run typecheck` · API tests: `npm test`
 
-For the live voice call, export `ELEVENLABS_API_KEY` and `ELEVENLABS_AGENT_ID` before starting
-(see `.env.example`). Without them the app runs, but starting a call reports that the voice agent
-is not configured.
+## Provider mode matrix (test without consuming credits)
 
-## ElevenLabs voice agent
+| `VOICE_PROVIDER` | `COPILOT_PROVIDER` | Result |
+| --- | --- | --- |
+| `simulation` (or EL vars unset) | `mock` (default) | Typed demo, deterministic intake — zero external calls |
+| `simulation` | `live` | Typed demo, real Copilot brain |
+| `elevenlabs` (default when EL vars set) | `mock` | Real voice, deterministic brain |
+| `elevenlabs` | `live` | Full production architecture |
 
-The call phase uses ElevenLabs Agents over WebRTC:
+## Environment variables
 
-1. The browser asks for microphone permission.
-2. The frontend requests a **short-lived conversation token** from `GET /api/elevenlabs/token`.
-   The backend mints it with the server-side `ELEVENLABS_API_KEY` — **the API key never reaches
-   the browser.**
-3. The official `@elevenlabs/client` SDK (loaded as an ES module) opens the WebRTC session:
-   microphone audio streams to the agent, the agent's voice plays back, and transcript events
-   flow both ways.
-4. Every final visitor transcript is forwarded to the existing `POST /api/demo/message` endpoint,
-   so requirement extraction and the live creative brief stay synchronized with the spoken
-   conversation. The ElevenLabs agent is the *only* voice — CreativeFlow never generates a second
-   spoken response.
-
-### Environment variables (required for voice)
-
-Add both in **Render Dashboard → creativeflow → Environment → Add Environment Variable**:
+Set real values in **Render Dashboard → creativeflow → Environment** — never in Git.
 
 | Variable | Purpose |
 | --- | --- |
-| `ELEVENLABS_API_KEY` | Secret ElevenLabs API key. Server-only — never committed, never sent to the browser. |
-| `ELEVENLABS_AGENT_ID` | The agent id of your ElevenLabs Agents agent. Kept server-side. |
+| `VOICE_PROVIDER` | `elevenlabs` \| `simulation` (credit-free typed mode) |
+| `COPILOT_PROVIDER` | `mock` (default) \| `live` |
+| `COPILOT_WORKFLOW_URL` | Synchronous Copilot Studio HTTP workflow endpoint (live mode) |
+| `COPILOT_AUTH_TOKEN` | Optional `Authorization: Bearer` token for that workflow |
+| `COPILOT_LLM_API_KEY` | Optional shared secret for the ElevenLabs Custom-LLM endpoint |
+| `ELEVENLABS_API_KEY` | Secret `sk_…` API key. Server-only. |
+| `ELEVENLABS_AGENT_ID` | ElevenLabs agent id. Server-side. |
+| `GEMINI_API_KEY`, `COMPOSIO_API_KEY` | Future production integrations (still mocked) |
 
-Do **not** put real values in `.env.example`, `render.yaml`, or anywhere else in Git.
+## Copilot Studio workflow contract
 
-### Recommended agent configuration (in the ElevenLabs dashboard)
+The backend POSTs each turn to `COPILOT_WORKFLOW_URL` (synchronous — e.g. a Power Automate
+“When an HTTP request is received” flow with a **Response** action, called from your Copilot
+Studio agent). Request:
 
-Configure the agent as a **Creative Director / creative intake agent** for CreativeFlow. It should
-sound like a real agency account manager: professional, natural, one question at a time, with
-follow-ups when an answer is vague. Suggested first message:
-
-> "Hi, I'm the CreativeFlow creative director. I'll quickly understand what you're looking to
-> create and then turn our conversation into a production-ready brief. What are we creating today?"
-
-Suggested system-prompt goals — collect, conversationally, one at a time:
-client/company · product/service · campaign · platform · target audience · duration ·
-aspect ratio · creative direction · mood · visual style · lighting · environment ·
-camera direction · color palette · motion · things to avoid.
-
-## Deploy (Render)
-
-The repo ships a `render.yaml` blueprint: one web service, no build step, health check on
-`/api/health`. Connect the repo in Render → *New → Blueprint* and deploy. All provider keys
-(`ELEVENLABS_API_KEY`, `ELEVENLABS_AGENT_ID`, `GEMINI_API_KEY`, `COMPOSIO_API_KEY`) are
-dashboard-managed secrets and never reach the browser.
-
-If you ever split the frontend into a separate static site, create `frontend/public/js/config.js`:
-
-```js
-window.CREATIVEFLOW_API_URL = "https://your-backend.onrender.com";
+```json
+{
+  "sessionId": "creativeflow-session-id",
+  "userMessage": "We're launching a premium skincare serum.",
+  "conversationState": { "client": null, "product": null, "platform": null, "...": null }
+}
 ```
 
-`js/api.js` picks it up automatically; same-origin is the default.
+Required machine-readable response:
 
-## Architecture
-
-```
-Browser microphone
-      ↓
-ElevenLabs Agent (WebRTC)   BrowserVoiceInput     (frontend/public/js/voice.js)
-      ↓  transcripts
-AI Creative Agent           ConversationService   (structured workflow engine)
-      ↓
-Requirement Extraction      typed CreativeRequirement{field,value,status,confidence,source}
-      ↓
-Creative Brief              BriefService          (mock: rule-derived direction)
-      ↓
-Tool / MCP Layer            (interface reserved — Composio/MCP later)
-      ↓
-Image + Video Generation    ProductionService     (mock: deterministic stage clock)
-      ↓
-Quality Review → Final Asset
+```json
+{
+  "responseText": "Which platform is the campaign for?",
+  "requirements": { "product": "Premium skincare serum" },
+  "missing": ["platform", "audience", "duration"],
+  "complete": false,
+  "readyForProduction": false,
+  "productionBrief": null
+}
 ```
 
-The ElevenLabs agent owns the *natural voice conversation*; CreativeFlow owns the *application
-workflow and state*. There is exactly one AI voice — the backend conversation engine is used for
-requirement extraction, not for generating competing spoken replies.
+`readyForProduction` must only become `true` after the client **explicitly confirms** the
+summarized brief — a filled brief is not an approved brief. On Copilot failure the backend
+returns the controlled fallback (“Sorry, I had a brief connection issue…”) — no second AI
+ever invents a reply.
 
-### Replaceable services
+## ElevenLabs agent configuration (dashboard)
 
-| Today | Later (production) | Contract |
-| --- | --- | --- |
-| `MockConversationService` (extraction) | LLM-backed extraction | `ConversationService` in `services/conversationService.ts` |
-| `MockBriefService` | LLM-backed brief builder | `BriefService` in `services/briefService.ts` |
-| `MockProductionService` | `GeminiVeoProductionService` | `ProductionService` in `services/productionService.ts` |
-| `BrowserVoiceInput` (ElevenLabs WebRTC — **live**) | — | `frontend/public/js/voice.js` |
-
-The final video player already handles both worlds: if `GeneratedAsset.url` is set it renders a
-`<video>`; while mocked (`url: null`) it falls back to a canvas-rendered simulated preview matching
-the confirmed creative direction.
+1. **Agent → LLM → Custom LLM**:
+   - Server URL: `https://creativeflow.onrender.com/api/copilot/llm/v1`
+   - Model ID: `creativeflow-copilot`
+   - API key: the value of `COPILOT_LLM_API_KEY` (if set)
+2. Enable the **Custom LLM extra body** option so the browser-supplied
+   `{ sessionId }` reaches the backend (sent by `voice.js` as `customLlmExtraBody`).
+3. Keep the agent's first message static (a greeting); every subsequent reply is
+   generated by Copilot through the bridge.
+4. Security → enable auth; allowlist your domains. The browser gets a short-lived
+   token from `GET /api/elevenlabs/token` — the API key never leaves the server.
 
 ## API
 
@@ -128,23 +121,26 @@ the confirmed creative direction.
 | --- | --- | --- |
 | `POST` | `/api/demo/session` | Start a call session |
 | `GET` | `/api/demo/session/:id` | Fetch session state |
-| `POST` | `/api/demo/message` | Send one client utterance (voice transcript or typed) |
-| `GET` | `/api/elevenlabs/token` | Mint a short-lived ElevenLabs conversation token (key stays server-side) |
+| `POST` | `/api/demo/message` | Legacy direct utterance endpoint |
+| `POST` | `/api/copilot/turn` | One conversational turn through the Copilot brain |
+| `GET` | `/api/copilot/state/:sessionId` | Authoritative Live-Brief state |
+| `POST` | `/api/copilot/llm/v1/chat/completions` | OpenAI-compatible endpoint for the ElevenLabs Custom LLM (SSE) |
+| `GET` | `/api/elevenlabs/token` | Mint a short-lived ElevenLabs conversation token |
 | `POST` | `/api/brief/build` | Build a brief from a completed conversation |
 | `POST` | `/api/brief/confirm` | Client approves the brief |
 | `POST` | `/api/brief/reopen` | Client wants changes; conversation reopens |
 | `GET` | `/api/brief/:id` | Fetch a brief |
 | `POST` | `/api/production/start` | Start production for a confirmed brief |
 | `GET` | `/api/production/:id` | Poll job state (stages, assets, summary) |
-| `GET` | `/api/health` | Service health + mode + voice configuration |
+| `GET` | `/api/health` | Health + `voice` + `copilot` provider status |
 
 ## Layout
 
 ```
 backend/
   src/
-    routes/        demo.ts · brief.ts · production.ts · elevenlabs.ts
-    services/      conversationService.ts · briefService.ts · productionService.ts
+    routes/        demo.ts · brief.ts · production.ts · elevenlabs.ts · copilot.ts
+    services/      conversationService.ts · briefService.ts · productionService.ts · copilotService.ts
     types/         creative.ts · conversation.ts
     mock/          conversation.ts · production.ts   ← only the mock layer touches these
     lib/           router.ts (dependency-free HTTP router + static host)
@@ -161,7 +157,8 @@ render.yaml
 
 ## What is intentionally not connected yet
 
-Gemini · Veo · Composio · n8n · Copilot Studio · MCP servers.
+Gemini · Veo · Composio · n8n production execution.
 
-Each has a reserved seam (service interface, env var, or frontend adapter). The live voice
-conversation (ElevenLabs Agents) is connected; the remaining integrations land one by one.
+Video generation remains **simulated** (`MockProductionService`). The confirmed brief is already
+exported as structured JSON (`buildProductionPayload`) ready for the future
+n8n / Composio → Gemini / Veo workflow.

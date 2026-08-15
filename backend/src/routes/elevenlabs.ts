@@ -1,0 +1,58 @@
+import type { Router } from "../lib/router.ts";
+import { sendJson } from "../lib/router.ts";
+
+/**
+ * ElevenLabs Agents integration.
+ *
+ * GET /api/elevenlabs/token → { token }
+ *
+ * The browser never sees ELEVENLABS_API_KEY. This endpoint uses the
+ * server-side key to mint a short-lived ElevenLabs *conversation token*
+ * for the configured agent; the frontend uses that token to open a
+ * WebRTC voice session directly with ElevenLabs.
+ *
+ * Configuration (Render dashboard → creativeflow → Environment):
+ *   ELEVENLABS_API_KEY   — secret ElevenLabs API key (server-only)
+ *   ELEVENLABS_AGENT_ID  — the ElevenLabs Agents agent id
+ */
+
+const ELEVENLABS_TOKEN_URL = "https://api.elevenlabs.io/v1/convai/conversation/token";
+
+export function registerElevenLabsRoutes(router: Router): void {
+  router.get("/api/elevenlabs/token", async ({ res }) => {
+    const apiKey = process.env.ELEVENLABS_API_KEY;
+    const agentId = process.env.ELEVENLABS_AGENT_ID;
+
+    if (!apiKey || !agentId) {
+      const missing = [
+        ...(apiKey ? [] : ["ELEVENLABS_API_KEY"]),
+        ...(agentId ? [] : ["ELEVENLABS_AGENT_ID"]),
+      ];
+      return sendJson(res, 503, { error: "elevenlabs_not_configured", missing });
+    }
+
+    let upstream: Response;
+    try {
+      upstream = await fetch(
+        `${ELEVENLABS_TOKEN_URL}?agent_id=${encodeURIComponent(agentId)}`,
+        { headers: { "xi-api-key": apiKey } },
+      );
+    } catch {
+      return sendJson(res, 502, { error: "elevenlabs_unreachable" });
+    }
+
+    if (!upstream.ok) {
+      // Log status only — never the key, never full upstream bodies with secrets.
+      console.error(`elevenlabs token request failed: http ${upstream.status}`);
+      return sendJson(res, 502, { error: "elevenlabs_error", status: upstream.status });
+    }
+
+    const data = (await upstream.json().catch(() => ({}))) as { token?: string };
+    if (!data.token) {
+      return sendJson(res, 502, { error: "elevenlabs_error" });
+    }
+
+    // Only the short-lived conversation token reaches the browser.
+    sendJson(res, 200, { token: data.token });
+  });
+}

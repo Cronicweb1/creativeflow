@@ -19,6 +19,14 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 22.18.0
+      # ElevenLabs Agents — live browser voice conversation.
+      # Set the real values in the Render dashboard:
+      #   creativeflow → Environment → Add Environment Variable
+      # They stay server-side and are never exposed to the browser.
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: ELEVENLABS_AGENT_ID
+        sync: false
       # Provider keys for future integrations. Set real values in the
       # Render dashboard; they stay server-side and are never exposed
       # to the browser.

@@ -4,14 +4,18 @@
  * A small state machine over the backend contract:
  *   precall → call → confirm → production → result
  *
- * All conversation and production state lives on the server; this module
- * renders it and forwards user input. The voice layer is injected, so the
- * simulated input can later be swapped for real browser voice capture
- * without touching this flow.
+ * The call phase is a REAL browser voice conversation: BrowserVoiceInput
+ * streams the visitor's microphone to an ElevenLabs agent over WebRTC and
+ * plays the agent's spoken replies. The ElevenLabs agent owns the natural
+ * conversation; CreativeFlow's backend owns the structured workflow — every
+ * final visitor transcript is forwarded to /api/demo/message so requirement
+ * extraction and the live creative brief keep updating. CreativeFlow never
+ * generates a second spoken reply (the backend reply text is used only for
+ * requirement extraction, not rendered or voiced).
  */
 
 import { api } from "./api.js";
-import { SimulatedVoiceInput } from "./voice.js";
+import { BrowserVoiceInput } from "./voice.js";
 import { RenderedPreview } from "./preview.js";
 
 const STATE_GLYPH = {
@@ -20,13 +24,12 @@ const STATE_GLYPH = {
   confirmed: { glyph: "✓", cls: "confirmed", label: "Confirmed" },
 };
 
-const AGENT_DELAY_MS = 900; // "thinking" pause before the agent replies
-
 export class DemoExperience {
   constructor(root, stage) {
     this.root = root;
     this.stage = stage;
-    this.voice = new SimulatedVoiceInput();
+    this.modeTag = document.getElementById("demo-mode-tag");
+    this.voice = new BrowserVoiceInput();
     this.session = null;
     this.brief = null;
     this.job = null;
@@ -36,6 +39,8 @@ export class DemoExperience {
     this.callSeconds = 0;
     this.preview = null;
     this.micGranted = false;
+    this.voiceConnected = false;
+    this._utteranceChain = Promise.resolve();
   }
 
   open() {
@@ -55,11 +60,22 @@ export class DemoExperience {
     clearInterval(this.pollId);
     this.preview?.destroy();
     this.preview = null;
-    this.voice.stop();
+    this.voice.onStatus = null;
+    this.voice.onMode = null;
+    this.voice.onError = null;
+    this.voice.onTranscript = null;
+    this.voice.onAgentTranscript = null;
+    void this.voice.stop(); // ends the ElevenLabs session + stops mic tracks
+    this.voiceConnected = false;
     this.session = null;
     this.brief = null;
     this.job = null;
     this.callSeconds = 0;
+    this._utteranceChain = Promise.resolve();
+  }
+
+  setModeTag(text) {
+    if (this.modeTag) this.modeTag.textContent = text;
   }
 
   /* ---------- view helpers ---------- */
@@ -73,42 +89,58 @@ export class DemoExperience {
 
   renderPrecall() {
     this.teardown();
+    this.setModeTag("Live voice demo");
     const view = this.setView(`
       <div class="precall">
-        <p class="eyebrow">Simulated client call</p>
+        <p class="eyebrow">Live client call</p>
         <h2>Ready to start?</h2>
-        <p>You'll act as the client while the AI Creative Agent gathers the requirements for your campaign.</p>
-        <p class="mic-note">Microphone access is required.</p>
+        <p>You'll act as the client. Speak naturally — the AI Creative Agent talks with you and gathers the requirements for your campaign.</p>
+        <p class="mic-note">Microphone access is required for the voice conversation.</p>
         <button class="btn btn-accent btn-lg" data-a="allow">Allow microphone &amp; start call</button>
         <p class="precall-error" hidden></p>
       </div>
     `);
     const btn = view.querySelector("[data-a=allow]");
     const errEl = view.querySelector(".precall-error");
+
+    const fail = (message) => {
+      btn.disabled = false;
+      btn.textContent = "Allow microphone & start call";
+      errEl.hidden = false;
+      errEl.textContent = message;
+    };
+
     btn.addEventListener("click", async () => {
       btn.disabled = true;
+      errEl.hidden = true;
+
+      // 1. Browser microphone permission.
       btn.textContent = "Requesting microphone…";
       const perm = await this.voice.requestPermission();
       this.micGranted = perm.granted;
       if (!perm.granted) {
-        // The simulation still works without a mic; be honest about it.
-        errEl.hidden = false;
-        errEl.textContent =
-          "Microphone unavailable — continuing in simulation mode. Voice capture will be enabled in the production integration.";
-        await pause(1400);
+        fail(
+          perm.reason === "unsupported"
+            ? "This browser does not support microphone access. Please use a current browser over HTTPS."
+            : "Microphone access was denied. The live call needs your microphone — please allow access and try again.",
+        );
+        return;
       }
+
+      // 2. CreativeFlow backend session (structured workflow layer).
       btn.textContent = "Connecting…";
       try {
         const { session, suggestedResponses } = await api.startSession();
         this.session = session;
         this.suggestions = suggestedResponses;
-        this.renderCall();
       } catch {
-        btn.disabled = false;
-        btn.textContent = "Allow microphone & start call";
-        errEl.hidden = false;
-        errEl.textContent = "Could not reach the CreativeFlow API. Please try again.";
+        fail("Could not reach the CreativeFlow API. Please try again.");
+        return;
       }
+
+      // 3. Render the call UI, then connect the ElevenLabs voice session.
+      this.renderCall();
+      this.connectVoice();
     });
   }
 
@@ -127,14 +159,14 @@ export class DemoExperience {
             </div>
             <p class="agent-name">AI Creative Agent</p>
             <p class="agent-role">Creative Director</p>
-            <p class="call-status"><span class="status-dot"></span><span data-el="status">Call in progress</span></p>
+            <p class="call-status"><span class="status-dot"></span><span data-el="status">Connecting to voice agent…</span></p>
             <p class="call-timer" data-el="timer">00:00</p>
           </div>
           <div class="transcript" data-el="transcript"></div>
           <div class="call-input" data-el="input">
             <div class="suggestions" data-el="suggestions"></div>
             <form class="input-row" data-el="form">
-              <input type="text" placeholder="Speak as the client — type your answer…" autocomplete="off" />
+              <input type="text" placeholder="Prefer typing? Optional fallback — just speak normally…" autocomplete="off" />
               <button class="btn btn-primary" type="submit">Send</button>
             </form>
             <div class="call-controls">
@@ -150,7 +182,7 @@ export class DemoExperience {
                 </svg>
               </button>
             </div>
-            <p class="mic-hint">${this.micGranted ? "Microphone connected — voice streaming arrives with the production integration." : "Simulation mode — answers are sent as text."}</p>
+            <p class="mic-hint" data-el="mic-hint">Connecting to voice agent…</p>
           </div>
         </section>
         <aside class="brief-panel" aria-label="Live creative brief">
@@ -169,6 +201,7 @@ export class DemoExperience {
       briefStatus: view.querySelector("[data-el=brief-status]"),
       timer: view.querySelector("[data-el=timer]"),
       status: view.querySelector("[data-el=status]"),
+      micHint: view.querySelector("[data-el=mic-hint]"),
       layout: view.querySelector(".call-layout"),
     };
 
@@ -179,14 +212,47 @@ export class DemoExperience {
       this.els.timer.textContent = fmtTime(this.callSeconds);
     }, 1000);
 
-    // Existing transcript + requirements (fresh session or reopened one).
-    for (const msg of this.session.messages) this.appendMessage(msg, false);
+    // Requirements panel (fresh session or reopened one).
     this.renderRequirements(this.session.requirements);
     this.renderSuggestions(this.suggestions);
 
-    // The voice layer delivers client utterances (typed now, transcribed later).
-    this.voice.onTranscript = (text) => this.handleClientUtterance(text);
+    // History: only what the visitor actually said before (reopened session).
+    // The ElevenLabs agent speaks its own greeting — the backend's scripted
+    // agent lines are never rendered, so there is exactly one AI voice.
+    for (const msg of this.session.messages) {
+      if (msg.speaker !== "agent") this.appendMessage(msg, false);
+    }
 
+    // Voice events → UI state.
+    this.voice.onStatus = (s) => {
+      if (s === "connecting") {
+        this.setStatus("Connecting to voice agent…");
+        this.setMicHint("Connecting to voice agent…");
+      } else if (s === "connected") {
+        this.voiceConnected = true;
+        this.setModeTag("Live voice call");
+        this.setStatus("Voice agent connected");
+        this.setMicHint("Microphone connected · Voice agent live");
+      } else if (s === "disconnected") {
+        this.voiceConnected = false;
+        this.setStatus("Call ended");
+        this.setMicHint("Call ended");
+        this.els?.layout?.classList.remove("call-active");
+      }
+    };
+    this.voice.onMode = (mode) => {
+      if (!this.voiceConnected) return;
+      this.setStatus(mode === "speaking" ? "AI speaking" : "Listening");
+    };
+    this.voice.onError = (message) => {
+      this.setStatus("Voice connection error");
+      this.setMicHint(message || "Voice connection error");
+      this.els?.layout?.classList.remove("call-active");
+    };
+    this.voice.onTranscript = (text) => this.handleClientUtterance(text);
+    this.voice.onAgentTranscript = (text) => this.appendMessage({ speaker: "agent", text });
+
+    // Optional typed fallback — routed through the same voice interface.
     this.els.form.addEventListener("submit", (e) => {
       e.preventDefault();
       const input = this.els.form.querySelector("input");
@@ -200,12 +266,32 @@ export class DemoExperience {
       const btn = e.currentTarget;
       const muted = !btn.classList.contains("ctl-muted");
       btn.classList.toggle("ctl-muted", muted);
-      this.voice.setMuted(muted);
+      this.voice.setMuted(muted); // actually mutes the ElevenLabs mic stream
+      if (this.voiceConnected) {
+        this.setMicHint(muted ? "Microphone muted" : "Microphone connected · Voice agent live");
+      }
     });
     view.querySelector("[data-a=end]").addEventListener("click", () => this.close());
   }
 
+  async connectVoice() {
+    try {
+      await this.voice.connect();
+    } catch {
+      /* surfaced via voice.onError → status "Voice connection error" */
+    }
+  }
+
+  setStatus(text) {
+    if (this.els?.status) this.els.status.textContent = text;
+  }
+
+  setMicHint(text) {
+    if (this.els?.micHint) this.els.micHint.textContent = text;
+  }
+
   renderSuggestions(list) {
+    if (!this.els?.suggestions) return;
     this.els.suggestions.innerHTML = "";
     for (const text of list || []) {
       const b = document.createElement("button");
@@ -218,6 +304,7 @@ export class DemoExperience {
   }
 
   appendMessage(msg, animate = true) {
+    if (!this.els?.transcript) return null;
     const el = document.createElement("div");
     el.className = `msg msg-${msg.speaker === "agent" ? "agent" : "client"}`;
     el.innerHTML = `
@@ -230,46 +317,41 @@ export class DemoExperience {
     return el;
   }
 
-  async handleClientUtterance(text) {
-    if (!this.session || this.busy) return;
-    this.busy = true;
-    this.renderSuggestions([]);
-    this.appendMessage({ speaker: "client", text });
+  /**
+   * A final visitor utterance (ElevenLabs transcript or typed fallback).
+   *
+   * The ElevenLabs agent already answers with voice — CreativeFlow only
+   * feeds the utterance to the backend for requirement extraction, so the
+   * live creative brief stays synchronized with the spoken conversation.
+   * Utterances are processed in order.
+   */
+  handleClientUtterance(text) {
+    this._utteranceChain = this._utteranceChain.then(async () => {
+      if (!this.session) return;
+      this.appendMessage({ speaker: "client", text });
+      this.renderSuggestions([]);
+      try {
+        const turn = await api.sendMessage(this.session.sessionId, text);
+        this.renderRequirements(turn.requirements);
+        this.session.phase = turn.phase;
 
-    const typing = this.appendMessage({ speaker: "agent", text: "…" });
-    typing.classList.add("msg-typing");
-
-    try {
-      const [turn] = await Promise.all([
-        api.sendMessage(this.session.sessionId, text),
-        pause(AGENT_DELAY_MS),
-      ]);
-      typing.remove();
-      this.appendMessage(turn.reply);
-      this.renderRequirements(turn.requirements);
-      this.session.phase = turn.phase;
-
-      if (turn.phase === "review") {
-        this.els.status.textContent = "Wrapping up";
-        this.els.briefStatus.textContent = "Requirements complete";
-        await pause(1600);
-        await this.renderConfirm();
-      } else {
-        this.renderSuggestions(turn.suggestedResponses);
+        if (turn.phase === "review") {
+          this.setStatus("Wrapping up");
+          if (this.els?.briefStatus) this.els.briefStatus.textContent = "Requirements complete";
+          await this.voice.stop(); // end the voice session before review
+          this.voiceConnected = false;
+          await pause(1600);
+          await this.renderConfirm();
+        }
+      } catch {
+        /* transient extraction error — the voice conversation continues */
       }
-    } catch (err) {
-      typing.remove();
-      this.appendMessage({
-        speaker: "agent",
-        text: "Sorry — the line dropped for a second. Could you say that again?",
-      });
-      this.renderSuggestions(this.suggestions);
-    } finally {
-      this.busy = false;
-    }
+    });
+    return this._utteranceChain;
   }
 
   renderRequirements(reqs) {
+    if (!this.els?.reqs) return;
     const prev = this.prevReqs || {};
     this.els.reqs.innerHTML = "";
     for (const r of reqs) {
@@ -292,6 +374,8 @@ export class DemoExperience {
 
   async renderConfirm() {
     clearInterval(this.timerId);
+    void this.voice.stop();
+    this.setModeTag("Simulated production");
     const { brief } = await api.buildBrief(this.session.sessionId);
     this.brief = brief;
 
@@ -325,7 +409,9 @@ export class DemoExperience {
       const { session } = await api.reopenSession(this.session.sessionId);
       this.session = session;
       this.suggestions = [];
+      this.setModeTag("Live voice demo");
       this.renderCall();
+      this.connectVoice(); // reconnect the voice agent for the follow-up conversation
     });
   }
 

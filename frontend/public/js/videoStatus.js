@@ -99,7 +99,7 @@ export function createVideoTracker(opts = {}) {
       if (now() - startedAt >= timeoutMs) {
         return emit(entry, {
           phase: "timeout",
-          error: "Video generation is taking longer than expected. Please check back later.",
+          error: "Video generation is taking longer than expected. You can check again shortly.",
         });
       }
       let status;
@@ -143,10 +143,31 @@ export function createVideoTracker(opts = {}) {
       }
       const existing = sessions.get(sessionId);
       if (existing) return existing.promise; // duplicate prevention
-      const entry = { state: { phase: "idle", sessionId }, stopped: false, promise: null };
+      const entry = {
+        state: { phase: "idle", sessionId },
+        stopped: false,
+        promise: null,
+        args: { sessionId, productionBrief, jobId },
+      };
       sessions.set(sessionId, entry);
-      entry.promise = run(entry, { sessionId, productionBrief, jobId });
+      entry.promise = run(entry, entry.args);
       return entry.promise;
+    },
+
+    /**
+     * Explicit user-initiated retry after failed/timeout. Never automatic.
+     * Clears the finished entry and re-tracks with the remembered brief.
+     */
+    retry(sessionId) {
+      const existing = sessions.get(sessionId);
+      if (!existing) return Promise.resolve(null);
+      if (!existing.stopped && !["failed", "timeout"].includes(existing.state.phase)) {
+        return existing.promise; // still running — nothing to retry
+      }
+      const args = { ...existing.args, jobId: null }; // force a fresh job
+      existing.stopped = true;
+      sessions.delete(sessionId);
+      return this.track(args);
     },
 
     isTracking(sessionId) {
@@ -166,6 +187,44 @@ export function createVideoTracker(opts = {}) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Job persistence — lets a page refresh resume polling an active job. */
+/* Uses sessionStorage (existing browser session scope); no new DB.    */
+/* ------------------------------------------------------------------ */
+
+const JOB_STORE_KEY = "cf_video_job";
+
+export function saveActiveJob(storage, { sessionId, jobId }, now = Date.now()) {
+  if (!storage || !sessionId || !jobId) return;
+  try {
+    storage.setItem(JOB_STORE_KEY, JSON.stringify({ sessionId, jobId, savedAt: now }));
+  } catch {
+    /* storage may be unavailable (private mode) — resume is best-effort */
+  }
+}
+
+export function loadActiveJob(storage, maxAgeMs = 10 * 60 * 1000, now = Date.now()) {
+  if (!storage) return null;
+  try {
+    const raw = storage.getItem(JOB_STORE_KEY);
+    if (!raw) return null;
+    const job = JSON.parse(raw);
+    if (!job || typeof job.sessionId !== "string" || typeof job.jobId !== "string") return null;
+    if (typeof job.savedAt !== "number" || now - job.savedAt > maxAgeMs) return null; // stale
+    return job;
+  } catch {
+    return null;
+  }
+}
+
+export function clearActiveJob(storage) {
+  try {
+    storage?.removeItem(JOB_STORE_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Browser UI (only runs in the page — nothing here touches the DOM    */
 /* at import time, so the module stays importable in Node tests)       */
 /* ------------------------------------------------------------------ */
@@ -175,7 +234,8 @@ let panelEl = null;
 let rootObserver = null;
 
 function demoRoot() {
-  return document.getElementById("demo-root") ?? document.body;
+  const root = document.getElementById("demo-root");
+  return root && !root.hidden ? root : document.body;
 }
 
 function ensureStyles() {
@@ -219,6 +279,7 @@ function renderState(state) {
   }
   const el = ensurePanel();
   if (state.phase === "completed") {
+    clearActiveJob(getStorage());
     // Only ever shown with a REAL videoUrl returned by the status endpoint.
     el.innerHTML = `<div class="video-panel-head done">Your video is ready</div>`;
     const video = document.createElement("video");
@@ -238,20 +299,43 @@ function renderState(state) {
     return;
   }
   if (state.phase === "failed" || state.phase === "timeout") {
+    clearActiveJob(getStorage());
     el.innerHTML = "";
     const head = document.createElement("div");
     head.className = "video-panel-head error";
-    head.textContent = "Video generation issue";
+    head.textContent = state.phase === "timeout" ? "Still working\u2026" : "Video generation failed";
     const note = document.createElement("p");
     note.className = "video-panel-note";
     note.textContent = state.error || "Video generation failed. Please try again.";
     el.append(head, note);
+    if (state.phase === "failed" && uiTracker) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn video-retry";
+      btn.textContent = "Try again";
+      btn.addEventListener("click", () => {
+        // Explicit user action — the only path that restarts generation.
+        void uiTracker?.retry(state.sessionId);
+      });
+      el.appendChild(btn);
+    }
     return;
   }
   // idle / starting / generating
+  if (state.phase === "generating" && state.jobId) {
+    saveActiveJob(getStorage(), { sessionId: state.sessionId, jobId: state.jobId });
+  }
   el.innerHTML =
     `<div class="video-panel-head"><span class="spinner"></span>Generating your video\u2026</div>` +
-    `<p class="video-panel-note">Gemini Veo is producing your creative. This can take a few minutes.</p>`;
+    `<p class="video-panel-note">Usually takes 30\u2013180 seconds.</p>`;
+}
+
+function getStorage() {
+  try {
+    return window.sessionStorage;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -282,8 +366,25 @@ export function onCopilotTurn(sessionId, turn, fetchJson) {
   });
 }
 
+/**
+ * Resume polling after a page refresh: if sessionStorage still holds an
+ * active (< 10 min old) job, re-attach to it by jobId. Never starts a new
+ * generation — it only polls the existing job's status endpoint.
+ */
+export function resumeVideoUi(fetchJson) {
+  const job = loadActiveJob(getStorage());
+  if (!job) return;
+  ensureStyles();
+  if (!uiTracker) {
+    uiTracker = createVideoTracker({ fetchJson, onUpdate: renderState });
+  }
+  if (uiTracker.isTracking(job.sessionId)) return;
+  void uiTracker.track({ sessionId: job.sessionId, productionBrief: null, jobId: job.jobId });
+}
+
 /** Reset on a fresh demo session so a new conversation starts clean. */
 export function resetVideoUi() {
+  clearActiveJob(getStorage());
   uiTracker?.stop();
   uiTracker = null;
   removePanel();

@@ -57,6 +57,9 @@ services:
       # to the browser.
       - key: GEMINI_API_KEY
         sync: false
+      # COMPOSIO_MCP_URL optional: pins the MCP transport
+      # (https://connect.composio.dev/mcp, header x-consumer-api-key).
+      # ck_ consumer keys use MCP automatically; ak_ keys use the REST API.
       - key: COMPOSIO_API_KEY
         sync: false
       # Video generation provider: composio (real Veo) or mock. Auto-detects

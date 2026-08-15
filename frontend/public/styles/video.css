@@ -32,3 +32,9 @@
   max-height: 220px;
 }
 .video-panel .video-download { align-self: flex-start; }
+
+.video-panel .video-retry {
+  margin-top: 10px;
+  align-self: flex-start;
+  cursor: pointer;
+}

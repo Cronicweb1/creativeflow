@@ -6,9 +6,11 @@ import { registerDemoRoutes } from "./routes/demo.ts";
 import { registerBriefRoutes } from "./routes/brief.ts";
 import { registerProductionRoutes } from "./routes/production.ts";
 import { registerElevenLabsRoutes } from "./routes/elevenlabs.ts";
+import { registerCopilotRoutes } from "./routes/copilot.ts";
 import { conversationService } from "./services/conversationService.ts";
 import { briefService } from "./services/briefService.ts";
 import { productionService } from "./services/productionService.ts";
+import { copilotProviderName, createCopilotProvider } from "./services/copilotService.ts";
 
 /**
  * CreativeFlow API + static host.
@@ -20,6 +22,7 @@ import { productionService } from "./services/productionService.ts";
  * Provider credentials come from the environment and are never exposed
  * to the browser:
  *   ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID  — live voice conversation
+ *   COPILOT_WORKFLOW_URL, COPILOT_AUTH_TOKEN — Copilot Studio brain (live mode)
  *   GEMINI_API_KEY, COMPOSIO_API_KEY         — future integrations (still mocked)
  */
 
@@ -28,15 +31,22 @@ const STATIC_ROOT = resolve(HERE, "../../frontend/public");
 const PORT = Number(process.env.PORT ?? 3000);
 
 const router = new Router(STATIC_ROOT);
+const copilotProvider = createCopilotProvider(conversationService);
+
+function voiceProviderName(): "elevenlabs" | "simulation" | "unconfigured" {
+  if ((process.env.VOICE_PROVIDER ?? "").toLowerCase() === "simulation") return "simulation";
+  return process.env.ELEVENLABS_API_KEY && process.env.ELEVENLABS_AGENT_ID
+    ? "elevenlabs"
+    : "unconfigured";
+}
 
 router.get("/api/health", ({ res }) => {
   sendJson(res, 200, {
     status: "ok",
     service: "creativeflow-api",
     mode: "simulation", // becomes "production" once real generation providers are wired in
-    voice: process.env.ELEVENLABS_API_KEY && process.env.ELEVENLABS_AGENT_ID
-      ? "elevenlabs"
-      : "unconfigured",
+    voice: voiceProviderName(),
+    copilot: copilotProviderName(),
     time: new Date().toISOString(),
   });
 });
@@ -45,6 +55,7 @@ registerDemoRoutes(router, conversationService);
 registerBriefRoutes(router, briefService, conversationService);
 registerProductionRoutes(router, productionService, briefService);
 registerElevenLabsRoutes(router);
+registerCopilotRoutes(router, copilotProvider, conversationService);
 
 const server = createServer((req, res) => {
   void router.dispatch(req, res);
@@ -53,4 +64,5 @@ const server = createServer((req, res) => {
 server.listen(PORT, () => {
   console.log(`CreativeFlow listening on http://localhost:${PORT}`);
   console.log(`Static root: ${STATIC_ROOT}`);
+  console.log(`Providers — voice: ${voiceProviderName()} · copilot: ${copilotProviderName()}`);
 });

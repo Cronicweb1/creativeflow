@@ -6,7 +6,7 @@
  * time via /js/config.js defining window.CREATIVEFLOW_API_URL.
  */
 
-import { onCopilotTurn, resetVideoUi } from "./videoStatus.js";
+import { onCopilotTurn, resetVideoUi, resumeVideoUi } from "./videoStatus.js";
 
 const BASE = (window.CREATIVEFLOW_API_URL || "").replace(/\/$/, "");
 
@@ -61,3 +61,11 @@ export const api = {
   generateVideo: (sessionId, productionBrief) =>
     request("POST", "/api/video/generate", { sessionId, productionBrief }),
 };
+
+// Page refresh: resume polling an active video job (if one was persisted for
+// this browser session). Never starts a new generation.
+try {
+  resumeVideoUi(request);
+} catch {
+  /* resume is best-effort */
+}

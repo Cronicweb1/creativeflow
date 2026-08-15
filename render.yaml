@@ -59,3 +59,7 @@ services:
         sync: false
       - key: COMPOSIO_API_KEY
         sync: false
+      # Video generation provider: composio (real Veo) or mock. Auto-detects
+      # composio when COMPOSIO_API_KEY is set; set explicitly to pin.
+      - key: VIDEO_GEN_PROVIDER
+        sync: false

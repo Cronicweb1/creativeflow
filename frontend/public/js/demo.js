@@ -28,6 +28,18 @@ import { api } from "./api.js";
 import { BrowserVoiceInput } from "./voice.js";
 import { RenderedPreview } from "./preview.js";
 
+const DEBUG =
+  /[?&]debug\b/.test(window.location.search) ||
+  (() => {
+    try {
+      return window.localStorage.getItem("cf_debug") === "1";
+    } catch {
+      return false;
+    }
+  })();
+
+const VOICE_READY_HINT = "Browser voice · free, no credits used";
+
 const STATE_GLYPH = {
   not_collected: { glyph: "○", cls: "", label: "Not collected" },
   being_determined: { glyph: "◌", cls: "determining", label: "Being determined" },
@@ -147,10 +159,11 @@ export class DemoExperience {
       btn.disabled = true;
       errEl.hidden = true;
 
-      // 1. Browser microphone permission.
+      // 1. Browser microphone permission — requested explicitly on start.
       btn.textContent = "Requesting microphone…";
       const perm = await this.voice.requestPermission();
       this.micGranted = perm.granted;
+      if (perm.granted) btn.textContent = "Microphone ready";
       if (!perm.granted) {
         fail(
           perm.reason === "unsupported"
@@ -226,7 +239,7 @@ export class DemoExperience {
             </div>
             <p class="agent-name">AI Creative Agent</p>
             <p class="agent-role">Creative Director</p>
-            <p class="call-status"><span class="status-dot"></span><span data-el="status">${voiceMode ? "Idle" : "Call in progress"}</span></p>
+            <p class="call-status"><span class="status-dot"></span><span data-el="status">${voiceMode ? "Ready" : "Call in progress"}</span></p>
             <p class="call-timer" data-el="timer">00:00</p>
           </div>
           <div class="transcript" data-el="transcript"></div>
@@ -302,14 +315,20 @@ export class DemoExperience {
     const muteBtn = view.querySelector("[data-a=mute]");
     muteBtn?.addEventListener("click", (e) => {
       const btn = e.currentTarget;
+      // Idle + unmuted = tap-to-talk: resume listening after a silence timeout.
+      if (!this.voice.muted && this.voiceState === "idle" && !this.wrappingUp) {
+        this.setMicHint(VOICE_READY_HINT);
+        this.voice.startListening();
+        return;
+      }
       const muted = !btn.classList.contains("ctl-muted");
       btn.classList.toggle("ctl-muted", muted);
-      this.voice.setMuted(muted); // muted = recognition stopped entirely
+      this.voice.setMuted(muted); // muted = recognition stopped immediately
       if (muted) {
         this.setVoiceState("idle");
         this.setMicHint("Microphone muted");
       } else {
-        this.setMicHint("Browser voice · free, no credits used");
+        this.setMicHint(VOICE_READY_HINT);
         if (this.voiceState !== "thinking" && this.voiceState !== "speaking") {
           this.voice.startListening();
         }
@@ -322,30 +341,64 @@ export class DemoExperience {
 
   bindVoiceEvents() {
     // FINAL visitor utterance from the browser recognizer → one backend turn.
-    this.voice.onTranscript = (text) => this.handleTurn(text);
-    // Live interim transcript — shown in the hint line while speaking.
+    // Interim transcripts are NEVER submitted — only displayed.
+    this.voice.onTranscript = (text) => {
+      this.showInterim("");
+      this.handleTurn(text);
+    };
+    // Live interim transcript — visible bubble so capture can be verified.
     this.voice.onInterim = (text) => {
-      if (this.voiceState === "listening") {
-        this.setMicHint(text ? `“${text}…”` : "Browser voice · free, no credits used");
-      }
+      if (this.voiceState !== "listening") return;
+      this.showInterim(text);
+      this.setMicHint(text ? "Hearing you…" : VOICE_READY_HINT);
     };
     this.voice.onListeningStateChange = (listening) => {
       if (this.wrappingUp) return;
       if (listening) this.setVoiceState("listening");
       else if (this.voiceState === "listening") this.setVoiceState("idle");
+      if (!listening) this.showInterim("");
+    };
+    this.voice.onSpeakingStateChange = (speaking) => {
+      if (this.wrappingUp) return;
+      if (speaking) this.setVoiceState("speaking");
     };
     this.voice.onError = (reason) => {
       const message =
         reason === "unsupported"
-          ? "This browser does not support speech recognition — type your answers below."
+          ? "Voice input isn't supported in this browser — type your answers below."
           : reason === "denied"
             ? "Microphone access was blocked — allow it in the browser, or type your answers below."
             : reason === "audio"
               ? "No microphone was found — check your input device, or type your answers below."
-              : "Speech recognition hit a snag — tap the mic to retry, or type your answers below.";
+              : reason === "network"
+                ? "Speech recognition needs a network connection — tap the mic to retry, or type below."
+                : reason === "silence"
+                  ? "Didn't catch anything — tap the mic to try again, or type your answer below."
+                  : "Speech recognition hit a snag — tap the mic to retry, or type your answers below.";
       this.setVoiceState("idle");
+      this.showInterim("");
       this.setMicHint(message);
     };
+  }
+
+  /** Live "You: …" bubble in the transcript while the browser is hearing you. */
+  showInterim(text) {
+    if (!this.els?.transcript) return;
+    let el = this.els.transcript.querySelector(".msg-interim");
+    if (!text) {
+      el?.remove();
+      return;
+    }
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "msg msg-client msg-interim";
+      el.style.opacity = "0.55";
+      el.innerHTML = `<p class="msg-speaker">You</p><p class="msg-text"></p>`;
+      el.style.animation = "none";
+      this.els.transcript.appendChild(el);
+    }
+    el.querySelector(".msg-text").textContent = `“${text}…”`;
+    this.els.transcript.scrollTop = this.els.transcript.scrollHeight;
   }
 
   /** Speak the agent's opening line, then hand the mic to the visitor. */
@@ -367,7 +420,7 @@ export class DemoExperience {
   setVoiceState(state) {
     this.voiceState = state;
     if (!this.voiceMode) return;
-    const label = { idle: "Idle", listening: "Listening…", thinking: "Thinking…", speaking: "Speaking…" }[state];
+    const label = { idle: "Ready", listening: "Listening…", thinking: "Thinking…", speaking: "Speaking…" }[state];
     if (label) this.setStatus(label);
   }
 
@@ -388,6 +441,13 @@ export class DemoExperience {
 
       let turn;
       try {
+        if (DEBUG) {
+          // Payload log for development — no secrets are ever in this payload.
+          console.info("[CreativeFlow] /api/copilot/turn payload:", {
+            sessionId: this.session.sessionId,
+            userMessage: text,
+          });
+        }
         turn = await api.copilotTurn(this.session.sessionId, text);
       } catch {
         this.setStatus("Creative intelligence temporarily unavailable");

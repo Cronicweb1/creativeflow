@@ -32,6 +32,8 @@ export interface VideoJob {
   videoUrl: string | null;
   downloadUrl: string | null;
   error: string | null;
+  /** Full sanitized upstream error (internal; never sent to clients). */
+  errorDetail?: string | null;
   createdAt: string;
   completedAt: string | null;
 }
@@ -161,7 +163,8 @@ abstract class BaseVideoService implements VideoService {
     job.completedAt = new Date().toISOString();
   }
 
-  protected fail(job: VideoJob, error: string): void {
+  protected fail(job: VideoJob, error: string, detail?: string): void {
+    job.errorDetail = sanitizeError(detail ?? error, 2000);
     job.status = "failed";
     job.error = sanitizeError(error);
     job.completedAt = new Date().toISOString();
@@ -171,14 +174,14 @@ abstract class BaseVideoService implements VideoService {
 }
 
 /** Coerce any thrown/returned error shape (string, Error, object) to text. */
-export function errorText(err: unknown): string {
+export function errorText(err: unknown, maxLen = 500): string {
   if (typeof err === "string") return err;
   if (err instanceof Error) return err.message;
   if (err && typeof err === "object") {
     const m = (err as Record<string, unknown>).message;
     if (typeof m === "string" && m) return m;
     try {
-      return JSON.stringify(err).slice(0, 500);
+      return JSON.stringify(err).slice(0, maxLen);
     } catch {
       return "video_generation_failed";
     }
@@ -187,10 +190,34 @@ export function errorText(err: unknown): string {
 }
 
 /** Never let credentials or auth headers leak into stored error strings. */
-function sanitizeError(message: unknown): string {
-  return errorText(message)
+function sanitizeError(message: unknown, maxLen = 500): string {
+  return errorText(message, maxLen)
     .replace(/(x-api-key|api[_-]?key|bearer)\s*[:=]\s*\S+/gi, "$1: [redacted]")
-    .slice(0, 500);
+    .slice(0, maxLen);
+}
+
+/* ------------------------------------------------------------------ */
+/* Quota / retry helpers (Fix E)                                       */
+/* ------------------------------------------------------------------ */
+
+/** Veo model pinned to what Composio-managed shared credentials support. */
+export const VEO_MODEL = "veo-3.1-lite-generate-preview";
+
+/** True when an upstream error is HTTP 429 / RESOURCE_EXHAUSTED (quota). */
+export function isQuotaExhausted(text: string): boolean {
+  return /(\b429\b|RESOURCE_EXHAUSTED|exceeded\s+your\s+current\s+quota|quota\s+exceeded)/i.test(text);
+}
+
+/**
+ * Extract Google's suggested retryDelay ("34s" / "12.5s") from an upstream
+ * error blob. Returns milliseconds, capped for safety, or null if absent.
+ */
+export function parseRetryDelayMs(text: string, capMs = 120_000): number | null {
+  const m = /retryDelay["'\s:]+["']?(\d+(?:\.\d+)?)s/i.exec(text);
+  if (!m) return null;
+  const ms = Math.round(parseFloat(m[1]) * 1000);
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  return Math.min(ms, capMs);
 }
 
 /* ------------------------------------------------------------------ */
@@ -298,7 +325,7 @@ export class McpToolClient {
     if (sid) this.mcpSessionId = sid;
     const text = await res.text();
     if (!res.ok) {
-      throw new Error(`composio_mcp_http_${res.status}: ${sanitizeError(text).slice(0, 200)}`);
+      throw new Error(`composio_mcp_http_${res.status}: ${sanitizeError(text, 800).slice(0, 800)}`);
     }
     if (!text.trim()) return null; // notifications answer with an empty body
     const ct = res.headers.get("content-type") ?? "";
@@ -306,7 +333,7 @@ export class McpToolClient {
       | McpRpcResponse
       | null;
     if (json && typeof json === "object" && json.error) {
-      throw new Error(`composio_mcp_rpc: ${sanitizeError(json.error).slice(0, 250)}`);
+      throw new Error(`composio_mcp_rpc: ${sanitizeError(json.error, 800).slice(0, 800)}`);
     }
     return json;
   }
@@ -368,7 +395,7 @@ export class McpToolClient {
     }
     if (result.isError) {
       throw new Error(
-        `composio_mcp_${toolSlug.toLowerCase()}_failed: ${sanitizeError(payload ?? "tool_error").slice(0, 250)}`,
+        `composio_mcp_${toolSlug.toLowerCase()}_failed: ${sanitizeError(payload ?? "tool_error", 800).slice(0, 800)}`,
       );
     }
     if (!payload || typeof payload !== "object") {
@@ -387,6 +414,12 @@ export class ComposioVeoVideoService extends BaseVideoService {
   private generateTimeoutMs: number;
   private waitTimeoutMs: number;
   private sessionFactory: ComposioSessionFactory;
+  /** Injectable sleep so retry timing is testable without real waits. */
+  private sleep: (ms: number) => Promise<void>;
+  /** Fallback retry delays (ms) when upstream gives no retryDelay. */
+  private retryDelaysMs: number[];
+  /** Max retries after the initial GEMINI_GENERATE_VIDEOS attempt. */
+  private maxGenerateRetries: number;
   /** One Composio session (and MCP client) per CreativeFlow session. */
   private sessionClients = new Map<string, Promise<McpToolClient>>();
   /** Persisted Composio session ids so a session can be re-attached. */
@@ -398,6 +431,9 @@ export class ComposioVeoVideoService extends BaseVideoService {
     sessionFactory?: ComposioSessionFactory;
     generateTimeoutMs?: number;
     waitTimeoutMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+    retryDelaysMs?: number[];
+    maxGenerateRetries?: number;
   }) {
     super();
     this.apiKey = opts?.apiKey ?? process.env.COMPOSIO_API_KEY ?? "";
@@ -409,6 +445,9 @@ export class ComposioVeoVideoService extends BaseVideoService {
     // GEMINI_WAIT_FOR_VIDEO polls internally; Veo jobs can take up to ~12 min.
     this.waitTimeoutMs = opts?.waitTimeoutMs ?? 14 * 60_000;
     this.sessionFactory = opts?.sessionFactory ?? new SdkComposioSessionFactory({ apiKey: this.apiKey || undefined });
+    this.sleep = opts?.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    this.retryDelaysMs = opts?.retryDelaysMs ?? [30_000, 60_000];
+    this.maxGenerateRetries = opts?.maxGenerateRetries ?? 2;
   }
 
   /** Create (or reuse) the Composio session for a CreativeFlow session. */
@@ -477,26 +516,55 @@ export class ComposioVeoVideoService extends BaseVideoService {
   }
 
   protected async run(job: VideoJob, brief: Record<string, unknown>): Promise<void> {
-    // 1. Kick off the Veo generation job.
-    const gen = await this.execute(
-      job.sessionId,
-      "GEMINI_GENERATE_VIDEOS",
-      {
-        prompt: buildVideoPrompt(brief),
-        duration_seconds: briefDurationSeconds(brief),
-        aspect_ratio: briefAspectRatio(brief),
-        resolution: "720p",
-      },
-      this.generateTimeoutMs,
-    );
-    if (gen.successful === false) {
-      this.fail(job, gen.error ? errorText(gen.error) : "veo_generate_failed");
-      return;
-    }
-    const operationName = gen.data?.operation_name;
-    if (typeof operationName !== "string" || !operationName) {
-      this.fail(job, "veo_generate_missing_operation_name");
-      return;
+    // 1. Kick off the Veo generation job. Quota errors (429 /
+    //    RESOURCE_EXHAUSTED) get a bounded retry: up to maxGenerateRetries
+    //    additional FRESH generate calls (a failed attempt's operation_name
+    //    is never reused). All other failures fail immediately.
+    const genArgs = {
+      model: VEO_MODEL,
+      prompt: buildVideoPrompt(brief),
+      duration_seconds: briefDurationSeconds(brief),
+      aspect_ratio: briefAspectRatio(brief),
+      resolution: "720p",
+    };
+    let operationName: string | null = null;
+    for (let attempt = 0; ; attempt++) {
+      let failure: string | null = null;
+      try {
+        const gen = await this.execute(
+          job.sessionId,
+          "GEMINI_GENERATE_VIDEOS",
+          genArgs,
+          this.generateTimeoutMs,
+        );
+        if (gen.successful === false) {
+          failure = gen.error ? errorText(gen.error, 2000) : "veo_generate_failed";
+        } else {
+          const op = gen.data?.operation_name;
+          if (typeof op !== "string" || !op) {
+            this.fail(job, "veo_generate_missing_operation_name");
+            return;
+          }
+          operationName = op;
+          break;
+        }
+      } catch (err: unknown) {
+        failure = errorText(err, 2000);
+      }
+      if (!isQuotaExhausted(failure)) {
+        // 400/401/403/404/safety/etc. - never retried.
+        this.fail(job, failure);
+        return;
+      }
+      if (attempt >= this.maxGenerateRetries) {
+        // Final quota failure: friendly message out, full detail retained.
+        this.fail(job, "Veo generation quota temporarily exhausted after retries.", failure);
+        return;
+      }
+      const delayMs =
+        parseRetryDelayMs(failure) ??
+        this.retryDelaysMs[Math.min(attempt, this.retryDelaysMs.length - 1)];
+      await this.sleep(delayMs);
     }
 
     // 2. Wait for completion (Composio polls Gemini internally and returns

@@ -141,7 +141,7 @@ test("video generation — composio provider: success, failure, no key leak", as
       if (req.url?.endsWith("/GEMINI_GENERATE_VIDEOS")) {
         assert.ok(String(body.arguments?.prompt ?? "").length > 10, "prompt built from brief");
         if (failNext) {
-          res.end(JSON.stringify({ successful: false, error: "RESOURCE_EXHAUSTED: quota", data: {} }));
+          res.end(JSON.stringify({ successful: false, error: "400 INVALID_ARGUMENT: prompt rejected", data: {} }));
           return;
         }
         res.end(

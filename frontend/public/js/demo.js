@@ -25,7 +25,7 @@
  */
 
 import { api } from "./api.js";
-import { BrowserVoiceInput } from "./voice.js";
+import { BrowserVoiceInput, RecordedVoiceInput } from "./voice.js";
 import { RenderedPreview } from "./preview.js";
 
 const DEBUG =
@@ -51,7 +51,7 @@ export class DemoExperience {
     this.root = root;
     this.stage = stage;
     this.modeTag = document.getElementById("demo-mode-tag");
-    this.voice = new BrowserVoiceInput();
+    this.voice = DemoExperience._pickVoiceEngine();
     this.health = null;
     this.session = null;
     this.brief = null;
@@ -62,15 +62,36 @@ export class DemoExperience {
     this.callSeconds = 0;
     this.preview = null;
     this.micGranted = false;
-    this.voiceState = "idle"; // idle | listening | thinking | speaking
+    this.voiceState = "idle"; // idle | listening | transcribing | thinking | speaking
     this.wrappingUp = false;
     this._turnChain = Promise.resolve();
+  }
+
+  /**
+   * PRIMARY: RecordedVoiceInput — MediaRecorder → server-side transcription.
+   * Chrome's SpeechRecognition network service failed in production, so the
+   * Web Speech engine is opt-in only (localStorage cf_stt_engine="webspeech").
+   */
+  static _pickVoiceEngine() {
+    try {
+      if (window.localStorage?.getItem?.("cf_stt_engine") === "webspeech") {
+        return new BrowserVoiceInput();
+      }
+    } catch {
+      /* storage unavailable */
+    }
+    return new RecordedVoiceInput();
   }
 
   get voiceMode() {
     // Voice is free and browser-native — use it whenever the browser supports
     // it, unless the server explicitly forces the typed simulation.
-    return this.health?.voice !== "simulation" && BrowserVoiceInput.isSupported();
+    return (
+      this.health?.voice !== "simulation" &&
+      (this.voice instanceof RecordedVoiceInput
+        ? RecordedVoiceInput.isSupported()
+        : BrowserVoiceInput.isSupported())
+    );
   }
 
   open() {
@@ -93,6 +114,7 @@ export class DemoExperience {
     this.voice.onTranscript = null;
     this.voice.onInterim = null;
     this.voice.onListeningStateChange = null;
+    this.voice.onTranscribing = null;
     this.voice.onError = null;
     this.voice.stop(); // stops recognition + TTS + mic tracks (all local, free)
     this.voiceState = "idle";
@@ -315,6 +337,12 @@ export class DemoExperience {
     const muteBtn = view.querySelector("[data-a=mute]");
     muteBtn?.addEventListener("click", (e) => {
       const btn = e.currentTarget;
+      // Recorder engine: tapping the mic while listening finishes the clip
+      // and sends it for transcription (tap → speak → tap again).
+      if (this.voiceState === "listening" && typeof this.voice.finishListening === "function") {
+        this.voice.finishListening();
+        return;
+      }
       // Idle + unmuted = tap-to-talk: resume listening after a silence timeout.
       if (!this.voice.muted && this.voiceState === "idle" && !this.wrappingUp) {
         this.setMicHint(VOICE_READY_HINT);
@@ -354,9 +382,19 @@ export class DemoExperience {
     };
     this.voice.onListeningStateChange = (listening) => {
       if (this.wrappingUp) return;
-      if (listening) this.setVoiceState("listening");
-      else if (this.voiceState === "listening") this.setVoiceState("idle");
+      if (listening) {
+        this.setVoiceState("listening");
+        if (typeof this.voice.finishListening === "function") {
+          this.setMicHint("Listening… tap the mic again when you finish speaking");
+        }
+      } else if (this.voiceState === "listening") this.setVoiceState("idle");
       if (!listening) this.showInterim("");
+    };
+    // "Transcribing…" — the recorded clip is being turned into text server-side.
+    this.voice.onTranscribing = (busy) => {
+      if (this.wrappingUp) return;
+      if (busy) this.setVoiceState("transcribing");
+      else if (this.voiceState === "transcribing") this.setVoiceState("idle");
     };
     this.voice.onSpeakingStateChange = (speaking) => {
       if (this.wrappingUp) return;
@@ -376,7 +414,13 @@ export class DemoExperience {
                   ? "Speech recognition doesn't support English on this device — type your answers below."
                   : reason === "silence"
                     ? "Didn't catch anything — tap the mic to try again, or type your answer below."
-                    : "Speech recognition hit a snag — tap the mic to retry, or type your answers below.";
+                    : reason === "record-failed"
+                      ? "Could not record microphone audio — tap the mic to retry, or type below."
+                      : reason === "transcribe-unavailable"
+                        ? "Voice transcription service is unavailable — try again shortly, or type below."
+                        : reason === "transcribe-failed"
+                          ? "Speech transcription failed — tap the mic to try again, or type below."
+                          : "Speech recognition hit a snag — tap the mic to retry, or type your answers below.";
       this.setVoiceState("idle");
       this.showInterim("");
       this.setMicHint(message);
@@ -429,7 +473,7 @@ export class DemoExperience {
       /* diagnostics only */
     }
     if (!this.voiceMode) return;
-    const label = { idle: "Tap mic to speak", listening: "Listening…", thinking: "Thinking…", speaking: "Speaking…" }[state];
+    const label = { idle: "Tap mic to speak", listening: "Listening…", transcribing: "Transcribing…", thinking: "Thinking…", speaking: "Speaking…" }[state];
     if (label) this.setStatus(label);
   }
 

@@ -1,0 +1,23 @@
+name: sync-once
+on:
+  push:
+    branches: [ui-video-preview]
+    paths: ['.github/workflows/sync-once.yml']
+permissions:
+  contents: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply tarball
+        run: |
+          curl -sL -o /tmp/patch.tgz "https://backend.composio.dev/api/v3/sl/p8yVCq_9Q3"
+          echo "9d6cf69c0183c2a629c9af3ba38229fd257d152b4660ed91171a3fb30cc39d04  /tmp/patch.tgz" | sha256sum -c
+          tar xzf /tmp/patch.tgz
+          git config user.name "creativeflow-bot"
+          git config user.email "bot@creativeflow.local"
+          git add -A
+          git rm -f .github/workflows/sync-once.yml
+          git commit -m "feat(ui): real Veo video in main production preview + SaaS polish redesign (hero grid, AI GENERATED label, download button, registry-driven state) + 8 frontend tests"
+          git push

@@ -6,7 +6,13 @@
  * time via /js/config.js defining window.CREATIVEFLOW_API_URL.
  */
 
-import { onCopilotTurn, resetVideoUi, resumeVideoUi } from "./videoStatus.js";
+import {
+  onCopilotTurn,
+  resetVideoUi,
+  resumeVideoUi,
+  isVideoPending,
+  syncProductionWithVideo,
+} from "./videoStatus.js";
 
 const BASE = (window.CREATIVEFLOW_API_URL || "").replace(/\/$/, "");
 
@@ -52,7 +58,11 @@ export const api = {
   confirmBrief: (briefId) => request("POST", "/api/brief/confirm", { briefId }),
   reopenSession: (sessionId) => request("POST", "/api/brief/reopen", { sessionId }),
   startProduction: (briefId) => request("POST", "/api/production/start", { briefId }),
-  getProduction: (jobId) => request("GET", `/api/production/${jobId}`),
+  // Timeline sync: while the REAL Veo video job is still pending, the
+  // simulated stage list is clamped so "Video generation" never claims
+  // completion ahead of the actual render (see videoStatus.js).
+  getProduction: async (jobId) =>
+    syncProductionWithVideo(await request("GET", `/api/production/${jobId}`), isVideoPending()),
   // Video generation (Composio → Gemini Veo). Jobs are normally started by
   // the Activepieces "Generate Video" branch; the frontend discovers and
   // polls them. generateVideo is a safe fallback (backend dedups by session).

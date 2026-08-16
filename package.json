@@ -2,7 +2,7 @@
   "name": "creativeflow",
   "version": "0.1.0",
   "private": true,
-  "description": "CreativeFlow — AI creative client-to-production showcase",
+  "description": "CreativeFlow \u2014 AI creative client-to-production showcase",
   "type": "module",
   "engines": {
     "node": ">=22.18"
@@ -11,10 +11,13 @@
     "start": "node backend/src/server.ts",
     "dev": "node --watch backend/src/server.ts",
     "typecheck": "tsc -p backend/tsconfig.json",
-    "test": "node --test backend/test/api.test.ts backend/test/voice.test.ts backend/test/voiceStt.test.ts backend/test/voiceRecorder.test.ts backend/test/transcribe.test.ts backend/test/video.test.ts backend/test/videoFrontend.test.ts"
+    "test": "node --test backend/test/api.test.ts backend/test/voice.test.ts backend/test/voiceStt.test.ts backend/test/voiceRecorder.test.ts backend/test/transcribe.test.ts backend/test/video.test.ts backend/test/videoSession.test.ts backend/test/videoFrontend.test.ts"
   },
   "devDependencies": {
-    "typescript": "^5.6.0",
-    "@types/node": "^22.0.0"
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "@composio/core": "^0.16.0"
   }
 }

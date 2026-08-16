@@ -98,6 +98,13 @@ export function buildVideoPrompt(brief: Record<string, unknown>): string {
   parts.push(
     `A high-production ${contentType}${product ? ` for ${product}` : ""}${client ? ` by ${client}` : ""}.`,
   );
+  // The user's actual product is the HERO SUBJECT — never let Veo drift into
+  // a generic portrait/lifestyle video that omits it.
+  if (product && !/^the (featured|user'?s) product$/i.test(product.trim())) {
+    parts.push(
+      `The ${product} is the hero subject of every shot: clearly show the ${product}, its packaging and presentation, in an attractive product-focused composition. Do not turn the advertisement into a generic portrait or lifestyle video without the ${product}.`,
+    );
+  }
   if (style) parts.push(`Visual style: ${style}.`);
   if (platform) parts.push(`Optimized for ${platform}.`);
   if (audience) parts.push(`Target audience: ${audience}.`);

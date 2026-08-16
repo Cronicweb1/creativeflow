@@ -34,6 +34,7 @@ export function normalizeMessage(message: string): string {
 
 const FORCE_ANYWHERE: RegExp[] = [
   /\b(don'?t|do not|no) (ask )?(any )?more questions\b/,
+  /\b(don'?t|do not) ask (me )?(anything|any ?more)( else| more| questions)?\b/,
   /\bstop asking( me)?( any| more)?( questions)?\b/,
   /\bjust (generate|create|make|do|build|produce)\b/,
   /\b(use )?whatever you think is best\b/,
@@ -123,6 +124,189 @@ export function inferAskedField(agentText: string): RequirementField | null {
   return null;
 }
 
+
+/* ---------- creative-intent extraction ---------- */
+
+/** Generic placeholder product values that must never beat a real product. */
+const GENERIC_PRODUCTS = new Set([
+  "the featured product",
+  "the user's product",
+  "the product",
+  "your product",
+]);
+
+export function isGenericProduct(value: string | null | undefined): boolean {
+  if (!value) return true;
+  return GENERIC_PRODUCTS.has(value.trim().toLowerCase());
+}
+
+const PLATFORM_CANON: Array<[RegExp, string]> = [
+  [/\binstagram\b|\breels?\b/, "Instagram"],
+  [/\btik ?tok\b/, "TikTok"],
+  [/\byou ?tube\b|\bshorts\b/, "YouTube"],
+  [/\bfacebook\b/, "Facebook"],
+  [/\blinked ?in\b/, "LinkedIn"],
+];
+
+const PLATFORM_WORDS = [
+  "instagram", "tiktok", "youtube", "facebook", "linkedin", "twitter",
+  "snapchat", "pinterest", "reels", "shorts",
+];
+
+const PRODUCT_STOPWORDS = new Set([
+  "video", "videos", "it", "this", "that", "one", "me", "us", "them",
+  "the", "a", "an", "new", "another", "some", "more", "quick", "short",
+  ...PLATFORM_WORDS,
+]);
+
+function cleanProduct(raw: string): string | null {
+  let p = raw.trim();
+  // Strip leading articles/possessives ("my premium skincare serum" => keep "premium ...").
+  for (;;) {
+    const next = p.replace(
+      /^(?:please|make|create|generate|produce|build|want|need|me|my|our|the|a|an|this|that|some|new)\s+/,
+      "",
+    );
+    if (next === p) break;
+    p = next;
+  }
+  // Platform names are not products ("Instagram ad" => no product).
+  p = p
+    .split(/\s+/)
+    .filter((w) => !PLATFORM_WORDS.includes(w))
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!p) return null;
+  if (p.split(" ").every((w) => PRODUCT_STOPWORDS.has(w))) return null;
+  if (p.length < 3 || p.length > 80) return null;
+  return p;
+}
+
+const NOUN = "[a-z0-9' -]+?";
+const END = "(?=\\s*(?:$|[.!?,;:]|\\band\\b|\\bdon'?t\\b|\\bdo not\\b|\\bplease\\b|\\bnow\\b|\\bthat\\b|\\bwhich\\b))";
+
+const PRODUCT_PATTERNS: RegExp[] = [
+  // "... ad/commercial/video for my premium skincare serum"
+  new RegExp(`\\b(?:ad|advert|advertisement|commercial|promo|video)\\s+for\\s+(${NOUN})${END}`),
+  // "... about my handmade candle shop"
+  new RegExp(`\\b(?:about|promoting|showcasing|featuring|advertising|selling)\\s+(${NOUN})${END}`),
+  // "create a makeup kit ad" / "make a coffee subscription commercial"
+  new RegExp(
+    `\\b(?:create|make|generate|produce|build|want|need|do)\\s+(?:me\\s+)?(?:an?\\s+|the\\s+)?(${NOUN})\\s+(?:ad|advert|advertisement|commercial|promo)\\b`,
+  ),
+  // "skincare serum advertisement" (bare noun phrase + ad word)
+  new RegExp(`(?:^|[.!?;,]\\s*)(${NOUN})\\s+(?:ad|advert|advertisement|commercial)\\b`),
+];
+
+/** Deterministic product/service extraction from a user message. */
+export function extractProductService(text: string): string | null {
+  const t = (text ?? "").toLowerCase().replace(/[\u2019\u2018\u0060]/g, "'");
+  for (const re of PRODUCT_PATTERNS) {
+    const m = re.exec(t);
+    if (m?.[1]) {
+      const cleaned = cleanProduct(m[1]);
+      if (cleaned) return cleaned;
+    }
+  }
+  return null;
+}
+
+/** Deterministic content-type extraction from a user message. */
+export function extractContentType(text: string): string | null {
+  const t = (text ?? "").toLowerCase();
+  if (/\bproduct video\b/.test(t)) return "product video";
+  if (/\b(ad|advert|advertisement|commercial|promo)\b/.test(t)) return "video advertisement";
+  return null;
+}
+
+/** Deterministic platform extraction from a user message. */
+export function extractPlatform(text: string): string | null {
+  const t = (text ?? "").toLowerCase();
+  for (const [re, canon] of PLATFORM_CANON) if (re.test(t)) return canon;
+  return null;
+}
+
+export interface CreativeIntent {
+  productService: string;
+  contentType: string;
+  platform: string;
+  visualStyle: string;
+  campaignObjective: string;
+  targetAudience: string;
+  duration: string;
+  aspectRatio: string;
+  mood: string;
+  colorPalette: string;
+  message: string;
+  brandName: string | null;
+  tagline: string | null;
+}
+
+function existingValue(
+  existing: Record<string, unknown> | null | undefined,
+  keys: string[],
+): string | null {
+  if (!existing) return null;
+  for (const k of keys) {
+    const v = existing[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return null;
+}
+
+/**
+ * Deterministic creative-intent resolver. Priority per field:
+ *   1. explicit value in the user's latest message (most specific wins),
+ *   2. real value already accumulated in the brief/requirements,
+ *   3. safe default (defaults NEVER replace user-provided information).
+ * A generic placeholder product ("the featured product") never beats a
+ * real product from either source. Never invents a brand name.
+ */
+export function extractCreativeIntent(
+  text: string,
+  existingBrief?: Record<string, unknown> | null,
+): CreativeIntent {
+  const ex = (keys: string[]) => existingValue(existingBrief, keys);
+
+  const extractedProduct = extractProductService(text);
+  const existingProduct = ex(["productService", "product"]);
+  const productService =
+    extractedProduct ??
+    (!isGenericProduct(existingProduct) ? (existingProduct as string) : null) ??
+    FIELD_DEFAULTS.product;
+
+  const brandRaw = ex(["brandName", "client"]);
+  const brandName = brandRaw && brandRaw !== "Unbranded" ? brandRaw : null;
+
+  const campaign = ex(["campaignObjective", "campaign"]);
+  const tagline = ex(["tagline"]);
+  const message =
+    ex(["message"]) ??
+    tagline ??
+    campaign ??
+    (!isGenericProduct(productService)
+      ? `Discover ${productService}.`
+      : "A premium showcase of the featured product.");
+
+  return {
+    productService,
+    contentType:
+      extractContentType(text) ?? ex(["contentType"]) ?? FIELD_DEFAULTS.contentType,
+    platform: extractPlatform(text) ?? ex(["platform"]) ?? FIELD_DEFAULTS.platform,
+    visualStyle: ex(["visualStyle"]) ?? FIELD_DEFAULTS.visualStyle,
+    campaignObjective: campaign ?? FIELD_DEFAULTS.campaign,
+    targetAudience: ex(["targetAudience", "audience"]) ?? FIELD_DEFAULTS.audience,
+    duration: ex(["duration"]) ?? FIELD_DEFAULTS.duration,
+    aspectRatio: ex(["aspectRatio"]) ?? FIELD_DEFAULTS.aspectRatio,
+    mood: ex(["mood"]) ?? "premium, polished and engaging",
+    colorPalette: ex(["colorPalette"]) ?? "modern neutral palette with warm accent tones",
+    message,
+    brandName,
+    tagline: tagline ?? null,
+  };
+}
+
 /** Sensible defaults — never a real/invented brand. */
 export const FIELD_DEFAULTS: Record<RequirementField, string> = {
   client: "Unbranded",
@@ -145,35 +329,62 @@ export const FIELD_DEFAULTS: Record<RequirementField, string> = {
 export function buildForcedBrief(
   sessionId: string,
   requirements: CreativeRequirement[],
+  latestMessage = "",
+  contextMessages: string[] = [],
 ): Record<string, unknown> {
   const known = (f: RequirementField): string | null =>
     requirements.find((r) => r.field === f)?.value ?? null;
-  const or = (f: RequirementField): string => known(f) ?? FIELD_DEFAULTS[f];
 
-  const product = or("product");
-  const rawClient = known("client");
-  // Never invent a real brand: unknown/declined brand => unbranded ad.
-  const brandName = rawClient && rawClient !== "Unbranded" ? rawClient : null;
+  const existing: Record<string, unknown> = {
+    product: known("product"),
+    client: known("client"),
+    campaign: known("campaign"),
+    platform: known("platform"),
+    contentType: known("contentType"),
+    visualStyle: known("visualStyle"),
+    audience: known("audience"),
+    duration: known("duration"),
+    aspectRatio: known("aspectRatio"),
+  };
+
+  let intent = extractCreativeIntent(latestMessage, existing);
+
+  // Still no real product from the latest message or accumulated brief?
+  // Scan earlier user messages (newest first) — user-provided information
+  // is NEVER discarded just because force mode triggered later.
+  if (isGenericProduct(intent.productService)) {
+    for (const msg of contextMessages) {
+      const p = extractProductService(msg);
+      if (p) {
+        intent = extractCreativeIntent(msg, { ...existing, product: p });
+        // Latest message still wins for contentType/platform if it had them.
+        const ct = extractContentType(latestMessage);
+        const pf = extractPlatform(latestMessage);
+        if (ct) intent = { ...intent, contentType: ct };
+        if (pf) intent = { ...intent, platform: pf };
+        break;
+      }
+    }
+  }
 
   return {
     sessionId,
     forceGenerate: true,
     brief: {
-      client: brandName,
-      brandName,
-      product,
-      campaign: or("campaign"),
-      platform: or("platform"),
-      contentType: or("contentType"),
-      visualStyle: or("visualStyle"),
-      audience: or("audience"),
-      duration: or("duration"),
-      aspectRatio: or("aspectRatio"),
-      mood: "premium, polished and engaging",
-      colorPalette: "modern neutral palette with warm accent tones",
-      message:
-        known("campaign") ??
-        (known("product") ? `Discover ${product}.` : "A premium showcase of the featured product."),
+      client: intent.brandName,
+      brandName: intent.brandName,
+      product: intent.productService,
+      campaign: intent.campaignObjective,
+      platform: intent.platform,
+      contentType: intent.contentType,
+      visualStyle: intent.visualStyle,
+      audience: intent.targetAudience,
+      duration: intent.duration,
+      aspectRatio: intent.aspectRatio,
+      mood: intent.mood,
+      colorPalette: intent.colorPalette,
+      message: intent.message,
+      tagline: intent.tagline,
     },
   };
 }

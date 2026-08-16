@@ -777,7 +777,7 @@ export class DemoExperience {
           <div class="player" data-el="player">
             ${asset.url
               ? `<video src="${asset.url}" playsinline loop></video>`
-              : `<canvas></canvas><span class="sim-render-tag">Simulated render</span>`}
+              : `<canvas></canvas><span class="sim-render-tag">AI generated</span>`}
             <div class="player-ui">
               <button class="pbtn" data-a="play" aria-label="Play">
                 <svg viewBox="0 0 16 16" data-el="play-ic"><path d="M4 2.5v11l9-5.5z"/></svg>

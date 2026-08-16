@@ -75,9 +75,10 @@ export function registerCopilotRoutes(
       conversationState: conversationState(conversation, sessionId),
     });
 
-    const productionBrief = result.readyForProduction
-      ? (result.productionBrief ?? buildProductionPayload(sessionId, conversation))
-      : result.productionBrief;
+    const productionBrief =
+      result.readyForProduction || result.forceGenerate === true
+        ? (result.productionBrief ?? buildProductionPayload(sessionId, conversation))
+        : result.productionBrief;
 
     sendJson(res, 200, {
       response: result.responseText,
@@ -86,6 +87,7 @@ export function registerCopilotRoutes(
       missing: result.missing,
       complete: result.complete,
       readyForProduction: result.readyForProduction,
+      forceGenerate: result.forceGenerate === true,
       productionBrief,
       provider: result.provider,
       degraded: result.degraded === true,

@@ -344,7 +344,8 @@ function getStorage() {
  * conversation flow is never touched — this is purely additive.
  */
 export function onCopilotTurn(sessionId, turn, fetchJson) {
-  if (!turn || turn.readyForProduction !== true) return;
+  // Router: generate when readyForProduction OR the user force-requested it.
+  if (!turn || (turn.readyForProduction !== true && turn.forceGenerate !== true)) return;
   if (!sessionId || typeof sessionId !== "string") return;
   ensureStyles();
   watchDemoRoot();

@@ -15,6 +15,13 @@
  */
 
 import crypto from "node:crypto";
+import {
+  SdkComposioSessionFactory,
+  composioUserId,
+  type ComposioMcpEndpoint,
+  type ComposioSessionFactory,
+  type ComposioSessionHandle,
+} from "./composioSession.ts";
 
 export type VideoJobStatus = "generating" | "completed" | "failed";
 
@@ -213,11 +220,16 @@ export class MockVideoService extends BaseVideoService {
 /* ------------------------------------------------------------------ */
 /* Composio → Gemini Veo provider                                      */
 /*                                                                     */
-/* Two transports, selected automatically:                             */
-/*  - MCP (Streamable HTTP): COMPOSIO_MCP_URL set, or the key looks    */
-/*    like a consumer key (ck_...). Endpoint defaults to               */
-/*    https://connect.composio.dev/mcp, auth header x-consumer-api-key.*/
-/*  - REST v3 execute API (backend.composio.dev, x-api-key) otherwise. */
+/* Transport: a Composio *session* created through the @composio/core  */
+/* SDK (composio.sessions.create). Every session exposes its own       */
+/* hosted MCP endpoint — session.mcp.url + session.mcp.headers — and   */
+/* tool calls are MCP tools/call requests against that endpoint. The   */
+/* generic https://connect.composio.dev/mcp endpoint and the manual    */
+/* x-consumer-api-key header are no longer used.                       */
+/*                                                                     */
+/* A test/dev REST override remains: when COMPOSIO_API_URL is set the  */
+/* provider calls <url>/api/v3/tools/execute/<TOOL> directly (this is  */
+/* how the spawned-server tests mock Composio without the SDK).        */
 /* ------------------------------------------------------------------ */
 
 /** Parse a text/event-stream body and return the last JSON `data:` payload. */
@@ -251,62 +263,34 @@ interface ComposioExecuteResponse {
   data?: Record<string, unknown>;
 }
 
-export class ComposioVeoVideoService extends BaseVideoService {
-  private apiKey: string;
-  private baseUrl: string;
-  private userId: string;
-  private generateTimeoutMs: number;
-  private waitTimeoutMs: number;
-  private mcpUrl: string | null;
+/**
+ * MCP client bound to ONE Composio session endpoint (session.mcp.url).
+ * Handles the initialize handshake and tools/call requests, tracking the
+ * mcp-session-id header the server assigns.
+ */
+export class McpToolClient {
+  private endpoint: ComposioMcpEndpoint;
   private mcpSessionId: string | null = null;
-  private mcpInit: Promise<void> | null = null;
+  private init: Promise<void> | null = null;
 
-  constructor(opts?: {
-    apiKey?: string;
-    baseUrl?: string;
-    userId?: string;
-    generateTimeoutMs?: number;
-    waitTimeoutMs?: number;
-    mcpUrl?: string | null;
-  }) {
-    super();
-    this.apiKey = opts?.apiKey ?? process.env.COMPOSIO_API_KEY ?? "";
-    this.baseUrl = (opts?.baseUrl ?? process.env.COMPOSIO_API_URL ?? "https://backend.composio.dev")
-      .replace(/\/+$/, "");
-    this.userId = opts?.userId ?? process.env.COMPOSIO_USER_ID ?? "default";
-    this.generateTimeoutMs = opts?.generateTimeoutMs ?? 60_000;
-    // GEMINI_WAIT_FOR_VIDEO polls internally; Veo jobs can take up to ~12 min.
-    this.waitTimeoutMs = opts?.waitTimeoutMs ?? 14 * 60_000;
-    // MCP transport: explicit URL wins; consumer keys (ck_...) default to
-    // Composio's hosted MCP endpoint with the x-consumer-api-key header.
-    const explicitRestUrl = Boolean(opts?.baseUrl ?? process.env.COMPOSIO_API_URL);
-    this.mcpUrl =
-      opts?.mcpUrl !== undefined
-        ? opts.mcpUrl
-        : process.env.COMPOSIO_MCP_URL ??
-          // Consumer keys (ck_...) only work against the hosted MCP endpoint —
-          // but an explicitly configured REST URL always takes precedence.
-          (this.apiKey.startsWith("ck_") && !explicitRestUrl
-            ? "https://connect.composio.dev/mcp"
-            : null);
+  constructor(endpoint: ComposioMcpEndpoint) {
+    this.endpoint = endpoint;
   }
 
-  /* ----------------------------- MCP ------------------------------ */
-
-  private mcpHeaders(): Record<string, string> {
+  private headers(): Record<string, string> {
     const h: Record<string, string> = {
+      ...this.endpoint.headers,
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
-      "x-consumer-api-key": this.apiKey,
     };
     if (this.mcpSessionId) h["mcp-session-id"] = this.mcpSessionId;
     return h;
   }
 
-  private async mcpRpc(body: Record<string, unknown>, timeoutMs: number): Promise<McpRpcResponse | null> {
-    const res = await fetch(this.mcpUrl as string, {
+  private async rpc(body: Record<string, unknown>, timeoutMs: number): Promise<McpRpcResponse | null> {
+    const res = await fetch(this.endpoint.url, {
       method: "POST",
-      headers: this.mcpHeaders(),
+      headers: this.headers(),
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -327,11 +311,11 @@ export class ComposioVeoVideoService extends BaseVideoService {
     return json;
   }
 
-  private async mcpEnsureSession(): Promise<void> {
+  private async ensureInitialized(): Promise<void> {
     if (this.mcpSessionId) return;
-    if (!this.mcpInit) {
-      this.mcpInit = (async () => {
-        await this.mcpRpc(
+    if (!this.init) {
+      this.init = (async () => {
+        await this.rpc(
           {
             jsonrpc: "2.0",
             id: 1,
@@ -344,26 +328,24 @@ export class ComposioVeoVideoService extends BaseVideoService {
           },
           30_000,
         );
-        await this.mcpRpc({ jsonrpc: "2.0", method: "notifications/initialized" }, 15_000).catch(
-          () => {
-            /* some servers skip the ack — not fatal */
-          },
-        );
+        await this.rpc({ jsonrpc: "2.0", method: "notifications/initialized" }, 15_000).catch(() => {
+          /* some servers skip the ack — not fatal */
+        });
       })().catch((err: unknown) => {
-        this.mcpInit = null; // allow a retry on the next job
+        this.init = null; // allow a retry on the next job
         throw err;
       });
     }
-    await this.mcpInit;
+    await this.init;
   }
 
-  private async executeMcp(
+  async executeTool(
     toolSlug: string,
     args: Record<string, unknown>,
     timeoutMs: number,
   ): Promise<ComposioExecuteResponse> {
-    await this.mcpEnsureSession();
-    const rpc = await this.mcpRpc(
+    await this.ensureInitialized();
+    const rpc = await this.rpc(
       {
         jsonrpc: "2.0",
         id: Date.now(),
@@ -397,41 +379,107 @@ export class ComposioVeoVideoService extends BaseVideoService {
     if ("successful" in obj || "data" in obj) return obj as ComposioExecuteResponse;
     return { successful: true, data: obj };
   }
+}
+
+export class ComposioVeoVideoService extends BaseVideoService {
+  private apiKey: string;
+  private restUrl: string | null;
+  private generateTimeoutMs: number;
+  private waitTimeoutMs: number;
+  private sessionFactory: ComposioSessionFactory;
+  /** One Composio session (and MCP client) per CreativeFlow session. */
+  private sessionClients = new Map<string, Promise<McpToolClient>>();
+  /** Persisted Composio session ids so a session can be re-attached. */
+  private composioSessionIds = new Map<string, string>();
+
+  constructor(opts?: {
+    apiKey?: string;
+    restUrl?: string | null;
+    sessionFactory?: ComposioSessionFactory;
+    generateTimeoutMs?: number;
+    waitTimeoutMs?: number;
+  }) {
+    super();
+    this.apiKey = opts?.apiKey ?? process.env.COMPOSIO_API_KEY ?? "";
+    // Test/dev override only: direct REST execute against a mock server.
+    const envRest = (process.env.COMPOSIO_API_URL ?? "").trim();
+    this.restUrl =
+      opts?.restUrl !== undefined ? opts.restUrl : envRest ? envRest.replace(/\/+$/, "") : null;
+    this.generateTimeoutMs = opts?.generateTimeoutMs ?? 60_000;
+    // GEMINI_WAIT_FOR_VIDEO polls internally; Veo jobs can take up to ~12 min.
+    this.waitTimeoutMs = opts?.waitTimeoutMs ?? 14 * 60_000;
+    this.sessionFactory = opts?.sessionFactory ?? new SdkComposioSessionFactory({ apiKey: this.apiKey || undefined });
+  }
+
+  /** Create (or reuse) the Composio session for a CreativeFlow session. */
+  private clientFor(creativeflowSessionId: string): Promise<McpToolClient> {
+    const userId = composioUserId(creativeflowSessionId);
+    let client = this.sessionClients.get(userId);
+    if (!client) {
+      client = (async () => {
+        const existingId = this.composioSessionIds.get(userId);
+        let handle: ComposioSessionHandle;
+        if (existingId) {
+          // Re-attach to the persisted Composio session where possible.
+          try {
+            handle = await this.sessionFactory.useSession(existingId);
+          } catch {
+            handle = await this.sessionFactory.createSession(userId);
+          }
+        } else {
+          handle = await this.sessionFactory.createSession(userId);
+        }
+        this.composioSessionIds.set(userId, handle.composioSessionId);
+        return new McpToolClient(handle.mcp);
+      })().catch((err: unknown) => {
+        this.sessionClients.delete(userId); // allow retry on next job
+        throw err;
+      });
+      this.sessionClients.set(userId, client);
+    }
+    return client;
+  }
 
   private async execute(
+    sessionId: string,
     toolSlug: string,
     args: Record<string, unknown>,
     timeoutMs: number,
   ): Promise<ComposioExecuteResponse> {
-    if (this.mcpUrl) return this.executeMcp(toolSlug, args, timeoutMs);
-    const res = await fetch(`${this.baseUrl}/api/v3/tools/execute/${toolSlug}`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": this.apiKey,
-      },
-      body: JSON.stringify({ user_id: this.userId, arguments: args }),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    const text = await res.text();
-    let json: ComposioExecuteResponse | null = null;
-    try {
-      json = JSON.parse(text) as ComposioExecuteResponse;
-    } catch {
-      /* non-JSON error body */
+    if (this.restUrl) {
+      // Test/dev REST override (mock Composio server).
+      const res = await fetch(`${this.restUrl}/api/v3/tools/execute/${toolSlug}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": this.apiKey,
+        },
+        body: JSON.stringify({ user_id: composioUserId(sessionId), arguments: args }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      const text = await res.text();
+      let json: ComposioExecuteResponse | null = null;
+      try {
+        json = JSON.parse(text) as ComposioExecuteResponse;
+      } catch {
+        /* non-JSON error body */
+      }
+      if (!res.ok) {
+        throw new Error(
+          `composio_${toolSlug.toLowerCase()}_http_${res.status}: ${sanitizeError(json?.error ?? text ?? "").slice(0, 200)}`,
+        );
+      }
+      if (!json) throw new Error(`composio_${toolSlug.toLowerCase()}_invalid_response`);
+      return json;
     }
-    if (!res.ok) {
-      throw new Error(
-        `composio_${toolSlug.toLowerCase()}_http_${res.status}: ${sanitizeError(json?.error ?? text ?? "").slice(0, 200)}`,
-      );
-    }
-    if (!json) throw new Error(`composio_${toolSlug.toLowerCase()}_invalid_response`);
-    return json;
+    const client = await this.clientFor(sessionId);
+    return client.executeTool(toolSlug, args, timeoutMs);
   }
 
   protected async run(job: VideoJob, brief: Record<string, unknown>): Promise<void> {
     // 1. Kick off the Veo generation job.
     const gen = await this.execute(
+      job.sessionId,
       "GEMINI_GENERATE_VIDEOS",
       {
         prompt: buildVideoPrompt(brief),
@@ -454,6 +502,7 @@ export class ComposioVeoVideoService extends BaseVideoService {
     // 2. Wait for completion (Composio polls Gemini internally and returns
     //    a downloadable file when done).
     const wait = await this.execute(
+      job.sessionId,
       "GEMINI_WAIT_FOR_VIDEO",
       { operation_name: operationName },
       this.waitTimeoutMs,
@@ -477,6 +526,7 @@ export class ComposioVeoVideoService extends BaseVideoService {
     this.complete(job, url, url);
   }
 }
+
 
 /* ------------------------------------------------------------------ */
 /* Provider selection                                                  */

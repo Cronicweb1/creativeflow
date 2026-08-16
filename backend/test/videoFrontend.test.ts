@@ -357,11 +357,11 @@ test("mcp: ComposioVeoVideoService full flow over a fake MCP server (SSE), no ke
   const { createServer } = await import("node:http");
   const { ComposioVeoVideoService } = await import("../src/services/videoService.ts");
   const MCP_PORT = 3991;
-  const KEY = "ck_test_mcp_secret_do_not_leak";
+  const KEY = "session-header-secret-do-not-leak";
   const seen: { headers: string[]; methods: string[] } = { headers: [], methods: [] };
 
   const server = createServer((req, res) => {
-    seen.headers.push(String(req.headers["x-consumer-api-key"] ?? ""));
+    seen.headers.push(String(req.headers["x-session-auth"] ?? ""));
     let raw = "";
     req.on("data", (c) => (raw += c));
     req.on("end", () => {
@@ -396,9 +396,22 @@ test("mcp: ComposioVeoVideoService full flow over a fake MCP server (SSE), no ke
   server.listen(MCP_PORT);
   t.after(() => server.close());
 
+  // Session-based transport: the fake factory stands in for
+  // composio.sessions.create and returns session.mcp.url/headers.
   const svc = new ComposioVeoVideoService({
-    apiKey: KEY,
-    mcpUrl: `http://127.0.0.1:${MCP_PORT}/mcp`,
+    apiKey: "ak_test_project_key",
+    restUrl: null,
+    sessionFactory: {
+      async createSession() {
+        return {
+          composioSessionId: "composio-sess-sse",
+          mcp: { url: `http://127.0.0.1:${MCP_PORT}/mcp`, headers: { "x-session-auth": KEY } },
+        };
+      },
+      async useSession() {
+        throw new Error("not used");
+      },
+    },
   });
   const job = svc.start("sess-mcp", { product: "smart bottle", visualStyle: "cinematic" });
   assert.equal(job.status, "generating");
@@ -409,7 +422,7 @@ test("mcp: ComposioVeoVideoService full flow over a fake MCP server (SSE), no ke
   assert.equal(done.status, "completed");
   assert.equal(done.videoUrl, "https://cdn.example/mcp-video.mp4");
   assert.equal(done.downloadUrl, "https://cdn.example/mcp-video.mp4");
-  assert.ok(seen.headers.every((h) => h === KEY), "MCP auth uses x-consumer-api-key");
+  assert.ok(seen.headers.every((h) => h === KEY), "MCP auth uses session.mcp.headers");
   assert.deepEqual(seen.methods, [
     "initialize",
     "notifications/initialized",

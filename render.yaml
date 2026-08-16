@@ -13,7 +13,7 @@ services:
     name: creativeflow
     runtime: node
     plan: free
-    buildCommand: "echo 'no build step — native TypeScript'"
+    buildCommand: "npm install --omit=dev"
     startCommand: "node backend/src/server.ts"
     healthCheckPath: /api/health
     envVars:
@@ -57,9 +57,10 @@ services:
       # to the browser.
       - key: GEMINI_API_KEY
         sync: false
-      # COMPOSIO_MCP_URL optional: pins the MCP transport
-      # (https://connect.composio.dev/mcp, header x-consumer-api-key).
-      # ck_ consumer keys use MCP automatically; ak_ keys use the REST API.
+      # COMPOSIO_API_KEY: Composio *project* API key (platform.composio.dev
+      # -> Settings -> API Keys), used server-side by @composio/core. Video
+      # generation creates a Composio session (gemini toolkit, direct_tools
+      # preset) and calls Veo via the session-provided MCP url/headers.
       - key: COMPOSIO_API_KEY
         sync: false
       # Video generation provider: composio (real Veo) or mock. Auto-detects

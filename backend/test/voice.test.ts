@@ -189,6 +189,15 @@ test("frontend sources — STT lifecycle invariants, no ElevenLabs agent usage",
   assert.ok(voiceSrc.includes("onSpeakingStateChange"), "speaking-state events required");
   // The demo routes transcripts through the backend brain.
   assert.ok(demoSrc.includes("copilotTurn"), "demo.js must call the copilot turn API");
+
+  // MediaRecorder → server STT is the PRIMARY voice-input path (Chrome's
+  // SpeechRecognition network service failed in production).
+  assert.ok(voiceSrc.includes("MediaRecorder"), "voice.js must record via MediaRecorder");
+  assert.ok(voiceSrc.includes("isTypeSupported"), "recorder MIME must be feature-detected");
+  assert.ok(voiceSrc.includes("/api/voice/transcribe"), "voice.js must use the server transcription endpoint");
+  assert.ok(!/GROQ_API_KEY/.test(voiceSrc) && !/gsk_[a-z0-9]/i.test(voiceSrc), "no Groq key in the browser");
+  assert.ok(demoSrc.includes("RecordedVoiceInput"), "demo.js must use the MediaRecorder engine");
+  assert.ok(demoSrc.includes("Transcribing"), "demo.js must surface the transcribing state");
 });
 
 test("toSpeakableText strips markdown, fences and JSON noise", async () => {

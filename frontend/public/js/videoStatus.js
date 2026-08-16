@@ -225,6 +225,55 @@ export function clearActiveJob(storage) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Production timeline sync (pure, DOM-free, unit-tested)              */
+/*                                                                     */
+/* The simulated production job (/api/production/:id) advances its     */
+/* stages on timers, while the REAL Veo job is polled separately by    */
+/* the tracker above. Without syncing, the timeline can claim          */
+/* "Video generation — Complete" while the real render is still        */
+/* running. These helpers clamp the simulated stages while a real      */
+/* video job is pending so both progress views stay in sync.           */
+/* ------------------------------------------------------------------ */
+
+const PENDING_PHASES = new Set(["idle", "starting", "generating"]);
+const VIDEO_STAGE_RE = /video\s*generation/i;
+const VIDEO_STAGE_DETAIL = "Rendering with Gemini Veo";
+
+/** True while a tracked real video job exists and has not resolved yet. */
+export function computeVideoPending(state) {
+  return !!state && PENDING_PHASES.has(state.phase);
+}
+
+/**
+ * Clamp a GET /api/production/:id response while the real video job is
+ * still pending:
+ *   - a simulated-complete "Video generation" stage is held at processing
+ *   - every stage after it is held at waiting
+ *   - job.status "complete" is held at "processing" so the result page
+ *     only renders once the real videoUrl exists
+ * Once the real job resolves (completed/failed/timeout), responses pass
+ * through untouched — including the failure path, which keeps its
+ * existing simulated result + retry UI.
+ */
+export function syncProductionWithVideo(response, pending) {
+  if (!pending) return response;
+  const job = response?.job;
+  if (!job || !Array.isArray(job.stages)) return response;
+  const idx = job.stages.findIndex((s) => VIDEO_STAGE_RE.test(String(s?.label ?? "")));
+  if (idx === -1) return response;
+  const stages = job.stages.map((s, i) => {
+    if (i < idx) return s;
+    if (i === idx) {
+      // Never let the simulation claim completion ahead of the real render.
+      return s.status === "waiting" ? s : { ...s, status: "processing", detail: VIDEO_STAGE_DETAIL };
+    }
+    return s.status === "waiting" ? s : { ...s, status: "waiting" };
+  });
+  const status = job.status === "complete" ? "processing" : job.status;
+  return { ...response, job: { ...job, stages, status } };
+}
+
+/* ------------------------------------------------------------------ */
 /* Browser UI (only runs in the page — nothing here touches the DOM    */
 /* at import time, so the module stays importable in Node tests)       */
 /* ------------------------------------------------------------------ */
@@ -232,6 +281,12 @@ export function clearActiveJob(storage) {
 let uiTracker = null;
 let panelEl = null;
 let rootObserver = null;
+let latestVideoState = null; // most recent tracker state (browser session)
+
+/** Browser-level: is the real video generation still pending right now? */
+export function isVideoPending() {
+  return computeVideoPending(latestVideoState);
+}
 
 function demoRoot() {
   const root = document.getElementById("demo-root");
@@ -345,6 +400,7 @@ function watchDemoRoot() {
 }
 
 function renderState(state) {
+  latestVideoState = state; // keep the production timeline in sync
   if (state.phase === "stopped") {
     removePanel();
     return;
@@ -462,6 +518,7 @@ export function resumeVideoUi(fetchJson) {
 export function resetVideoUi() {
   clearActiveJob(getStorage());
   clearCompletedVideos();
+  latestVideoState = null;
   uiTracker?.stop();
   uiTracker = null;
   removePanel();

@@ -1,5 +1,8 @@
 name: sync-once
-on: workflow_dispatch
+on:
+  push:
+    branches: [composio-sessions]
+    paths: [".github/workflows/sync-once.yml"]
 permissions:
   contents: write
 jobs:

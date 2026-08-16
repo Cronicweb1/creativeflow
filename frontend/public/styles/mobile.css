@@ -1,0 +1,56 @@
+/* ==========================================================================
+   CreativeFlow — mobile refinements (additive layer, loaded after main.css)
+   Pure CSS: no markup or handler changes; every button stays wired.
+   ========================================================================== */
+
+@media (max-width: 640px) {
+  html, body { overflow-x: hidden; }
+  .shell { padding: 0 18px; }
+
+  /* Demo takeover header: brand + tag + exit must fit one compact row */
+  .demo-header { padding: 0 14px; gap: 10px; }
+  .demo-header .brand-name { font-size: 15px; }
+  .demo-header-right { gap: 8px; }
+  .sim-tag { font-size: 9px; letter-spacing: 0.09em; padding: 3px 6px; white-space: nowrap; }
+  .demo-header .btn { padding: 7px 12px; font-size: 13.5px; white-space: nowrap; }
+
+  /* Landing */
+  .hero { padding: 56px 0 48px; }
+  .hero-sub { font-size: 16.5px; }
+  .hero-actions .btn { width: 100%; justify-content: center; }
+  .section { padding: 52px 0; }
+  .steps { grid-template-columns: 1fr; gap: 28px; }
+
+  /* Call view */
+  .call-main { padding: 22px 16px 16px; }
+  .brief-panel { padding: 22px 16px 40px; }
+  .transcript { max-height: 260px; }
+  .input-row input { min-width: 0; font-size: 16px; } /* 16px prevents iOS auto-zoom */
+  .suggestions { margin-bottom: 10px; }
+  .precall { padding: 36px 18px; }
+
+  /* Confirmation + production */
+  .confirm-view { padding: 36px 16px 56px; }
+  .confirm-actions .btn { width: 100%; justify-content: center; }
+  .production-view { padding: 32px 16px 64px; }
+  .stage { grid-template-columns: 32px 1fr auto; gap: 12px; }
+
+  /* Result page — leave room at the bottom so the floating video panel
+     never covers Download / fullscreen / brief / restart actions. */
+  .result-view { padding: 32px 16px 150px; }
+  .result-view h2 { font-size: 30px; }
+  .result-grid { gap: 28px; margin-top: 28px; }
+  .player { max-width: min(300px, 80vw); }
+  .result-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 20px; }
+  .result-actions .btn { width: 100%; }
+  .summary { margin-top: 32px; }
+  .summary-row { font-size: 14px; }
+  .brief-doc-head { padding: 12px 14px; }
+  .brief-doc-body { padding: 4px 14px 16px; }
+}
+
+@media (max-width: 380px) {
+  .result-actions { grid-template-columns: 1fr; }
+  .demo-header .brand-name { font-size: 14px; }
+  .sim-tag { display: none; } /* ultra-narrow: keep Exit demo reachable */
+}

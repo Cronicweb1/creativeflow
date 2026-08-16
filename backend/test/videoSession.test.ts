@@ -246,6 +246,7 @@ test("composio sessions — failure surfaces as failed job without key leak", as
     apiKey: SECRET,
     restUrl: null,
     sessionFactory: new SdkComposioSessionFactory({ sessions }),
+    sleep: async () => {}, // quota errors retry; keep the test instant
   });
 
   const job = svc.start("cf-sess-F", { product: "widget" });

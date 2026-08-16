@@ -11,7 +11,7 @@
     "start": "node backend/src/server.ts",
     "dev": "node --watch backend/src/server.ts",
     "typecheck": "tsc -p backend/tsconfig.json",
-    "test": "node --test backend/test/api.test.ts backend/test/voice.test.ts backend/test/voiceStt.test.ts backend/test/voiceRecorder.test.ts backend/test/transcribe.test.ts backend/test/video.test.ts backend/test/videoSession.test.ts backend/test/videoFrontend.test.ts"
+    "test": "node --test backend/test/api.test.ts backend/test/voice.test.ts backend/test/voiceStt.test.ts backend/test/voiceRecorder.test.ts backend/test/transcribe.test.ts backend/test/video.test.ts backend/test/videoSession.test.ts backend/test/videoRetry.test.ts backend/test/videoFrontend.test.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

@@ -1,0 +1,23 @@
+name: sync-once
+on:
+  push:
+    branches: [product-intent]
+    paths: ['.github/workflows/sync-once.yml']
+permissions:
+  contents: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply tarball
+        run: |
+          curl -sL -o /tmp/patch.tar.gz "https://backend.composio.dev/api/v3/sl/GqFKrIZi_h"
+          echo "80e2436ca348df469201fb31227b4c5a5bb5fcbe4c24a5c47c860d2d2aa5b199  /tmp/patch.tar.gz" | sha256sum -c -
+          tar xzf /tmp/patch.tar.gz -C .
+          git config user.name "creativeflow-bot"
+          git config user.email "bot@creativeflow.local"
+          git add -A
+          git rm -f .github/workflows/sync-once.yml
+          git commit -m "Preserve user product intent in force-generation briefs and Veo prompts"
+          git push

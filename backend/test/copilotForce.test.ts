@@ -267,3 +267,162 @@ test("F: 'No more questions' after partial info => video branch runs with defaul
   assert.equal(gen.data.status, "generating");
   assert.ok(gen.data.jobId);
 });
+
+/* ---------- creative-intent preservation (product never lost) ---------- */
+
+import {
+  extractProductService,
+  extractContentType,
+  extractCreativeIntent,
+} from "../src/services/forceGenerate.ts";
+import { buildVideoPrompt } from "../src/services/videoService.ts";
+
+function req(field: string, value: string | null) {
+  return { field, label: field, value, status: "confirmed", confidence: 1, source: "t" } as any;
+}
+
+test("intent A: 'Create a makeup kit ad and don't ask any more questions.'", async () => {
+  const msg = "Create a makeup kit ad and don't ask any more questions.";
+  assert.equal(detectForceGenerate(msg), true);
+  const conv = new MockConversationService();
+  const session = conv.startSession();
+  const guarded = new GuardedCopilotProvider(brandAskingProvider(), conv);
+  const r = await guarded.turn({ sessionId: session.sessionId, userMessage: msg, conversationState: {} });
+  assert.equal(r.forceGenerate, true);
+  assert.equal(r.readyForProduction, true);
+  const brief = (r.productionBrief as any).brief;
+  assert.match(brief.product, /makeup kit/);
+  assert.match(brief.contentType, /advertisement/);
+  assert.notEqual(brief.product, "the featured product");
+});
+
+test("intent B: Instagram ad for premium skincare serum", () => {
+  const brief = buildForcedBrief(
+    "s1",
+    [],
+    "Make an Instagram ad for my premium skincare serum. Don't ask anything else.",
+  ) as any;
+  assert.equal(brief.brief.product, "premium skincare serum");
+  assert.equal(brief.brief.platform, "Instagram");
+  assert.match(brief.brief.contentType, /advertisement/);
+});
+
+test("intent C: coffee subscription commercial", () => {
+  const brief = buildForcedBrief(
+    "s1",
+    [],
+    "Create a coffee subscription commercial. Just generate it.",
+  ) as any;
+  assert.equal(brief.brief.product, "coffee subscription");
+});
+
+test("intent D: existing product survives 'Don't ask any more questions.'", () => {
+  const brief = buildForcedBrief(
+    "s1",
+    [req("product", "makeup kit")],
+    "Don't ask any more questions.",
+  ) as any;
+  assert.equal(brief.brief.product, "makeup kit");
+});
+
+test("intent E: existing product survives bare 'Just generate it.'", () => {
+  const brief = buildForcedBrief("s1", [req("product", "makeup kit")], "Just generate it.") as any;
+  assert.equal(brief.brief.product, "makeup kit");
+});
+
+test("intent F: no brand supplied => brandName stays null", () => {
+  const brief = buildForcedBrief(
+    "s1",
+    [],
+    "Create a makeup kit ad and don't ask any more questions.",
+  ) as any;
+  assert.equal(brief.brief.brandName, null);
+  assert.equal(brief.brief.client, null);
+});
+
+test("intent G: force contract unchanged (forceGenerate/complete/ready/missing)", async () => {
+  const conv = new MockConversationService();
+  const session = conv.startSession();
+  const guarded = new GuardedCopilotProvider(brandAskingProvider(), conv);
+  const r = await guarded.turn({
+    sessionId: session.sessionId,
+    userMessage: "Create a makeup kit ad and don't ask any more questions.",
+    conversationState: {},
+  });
+  assert.equal(r.forceGenerate, true);
+  assert.equal(r.complete, true);
+  assert.equal(r.readyForProduction, true);
+  assert.deepEqual(r.missing, []);
+});
+
+test("intent H: ordinary product mentions do not trigger force generation", () => {
+  for (const msg of [
+    "I'm thinking about a makeup kit ad, what do you suggest?",
+    "The ad is for my makeup kit",
+    "We sell a coffee subscription",
+    "It's an Instagram advertisement for young adults",
+  ]) {
+    assert.equal(detectForceGenerate(msg), false, `should NOT force: "${msg}"`);
+  }
+});
+
+test("intent: product from EARLIER message is preserved when force comes later", () => {
+  const brief = buildForcedBrief("s1", [], "No more questions, just generate it.", [
+    "Something premium please",
+    "I want an ad for my handmade candle shop.",
+  ]) as any;
+  assert.equal(brief.brief.product, "handmade candle shop");
+});
+
+test("intent: latest specific product beats existing generic value", () => {
+  const brief = buildForcedBrief(
+    "s1",
+    [req("product", "the featured product")],
+    "Create a makeup kit ad and don't ask any more questions.",
+  ) as any;
+  assert.equal(brief.brief.product, "makeup kit");
+});
+
+test("extractCreativeIntent returns full deterministic field set", () => {
+  const i = extractCreativeIntent("Create a makeup kit ad", null);
+  assert.equal(i.productService, "makeup kit");
+  assert.equal(i.contentType, "video advertisement");
+  assert.equal(i.platform, "Instagram");
+  assert.equal(i.visualStyle, "cinematic");
+  assert.equal(i.campaignObjective, "brand awareness");
+  assert.equal(i.targetAudience, "general target audience");
+  assert.equal(i.duration, "8");
+  assert.equal(i.aspectRatio, "9:16");
+  assert.ok(i.mood && i.colorPalette);
+  assert.match(i.message, /makeup kit/);
+  assert.equal(i.brandName, null);
+  assert.equal(i.tagline, null);
+  // existing real value always preferred over defaults
+  const j = extractCreativeIntent("Just generate it", { product: "coffee subscription", platform: "TikTok" });
+  assert.equal(j.productService, "coffee subscription");
+  assert.equal(j.platform, "TikTok");
+});
+
+test("Veo prompt contains the actual product as hero subject, never the generic placeholder", () => {
+  const forced = buildForcedBrief(
+    "s1",
+    [],
+    "Create a makeup kit ad and don't ask any more questions.",
+  );
+  const prompt = buildVideoPrompt(forced);
+  assert.match(prompt, /makeup kit/);
+  assert.match(prompt, /hero subject/);
+  assert.ok(!prompt.includes("the featured product"));
+  // Generic fallback brief never claims a hero subject it doesn't have.
+  const generic = buildForcedBrief("s1", [], "Just generate it.");
+  const gPrompt = buildVideoPrompt(generic);
+  assert.ok(!gPrompt.includes("hero subject"));
+});
+
+test("extractProductService/ContentType edge cases", () => {
+  assert.equal(extractProductService("Make an Instagram ad"), null); // platform is not a product
+  assert.equal(extractProductService("Just generate the video"), null);
+  assert.equal(extractProductService("an ad for my handmade furniture collection"), "handmade furniture collection");
+  assert.equal(extractContentType("a product video for my shop"), "product video");
+  assert.equal(extractContentType("hello there"), null);
+});

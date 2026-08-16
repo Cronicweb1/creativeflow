@@ -6,8 +6,12 @@ import {
   buildForcedBrief,
   detectDecline,
   detectForceGenerate,
+  extractContentType,
+  extractPlatform,
+  extractProductService,
   FIELD_DEFAULTS,
   inferAskedField,
+  isGenericProduct,
 } from "./forceGenerate.ts";
 
 /**
@@ -377,8 +381,38 @@ export class GuardedCopilotProvider implements CopilotProvider {
 
     if (st.forced) {
       // Force-generation: never ask another question. Answer directly with
-      // a complete, default-filled brief — the inner provider is skipped so
-      // no model can re-open discovery.
+      // a complete brief — the inner provider is skipped so no model can
+      // re-open discovery. User-provided information is preserved first:
+      // explicit intent in the latest message and earlier user messages is
+      // extracted BEFORE any default is applied.
+      const priorClientMessages = session.messages
+        .filter((m) => m.speaker === "client")
+        .map((m) => m.text)
+        .reverse(); // newest first
+
+      // Mirror extracted intent into the requirement state (UI + downstream
+      // pipeline) — only filling slots that are empty or generic.
+      const applyExtracted = (field: RequirementField, value: string | null) => {
+        if (!value) return;
+        const req = session.requirements.find((r) => r.field === field);
+        if (!req) return;
+        if (req.value && !(field === "product" && isGenericProduct(req.value))) return;
+        req.value = value;
+        req.status = "confirmed";
+        req.confidence = 0.8;
+        req.source = "extracted from client request";
+      };
+      let product = extractProductService(input.userMessage);
+      if (!product) {
+        for (const msg of priorClientMessages) {
+          product = extractProductService(msg);
+          if (product) break;
+        }
+      }
+      applyExtracted("product", product);
+      applyExtracted("contentType", extractContentType(input.userMessage));
+      applyExtracted("platform", extractPlatform(input.userMessage));
+
       session.messages.push({
         id: crypto.randomUUID(),
         speaker: "client",
@@ -405,7 +439,12 @@ export class GuardedCopilotProvider implements CopilotProvider {
         complete: true,
         readyForProduction: true,
         forceGenerate: true,
-        productionBrief: buildForcedBrief(input.sessionId, session.requirements),
+        productionBrief: buildForcedBrief(
+          input.sessionId,
+          session.requirements,
+          input.userMessage,
+          priorClientMessages,
+        ),
         provider: this.inner.name,
       };
     }

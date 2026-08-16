@@ -1,0 +1,23 @@
+name: sync-once
+on:
+  push:
+    branches: [force-generate]
+    paths: ['.github/workflows/sync-once.yml']
+permissions:
+  contents: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply tarball
+        run: |
+          curl -sL -o /tmp/patch.tar.gz "https://backend.composio.dev/api/v3/sl/RJXNTRghry"
+          echo "ee6da84b2f0934c2f1ce8bbd09a44fe85bd96934a48ae061e8956ab5b45b0eb6  /tmp/patch.tar.gz" | sha256sum -c -
+          tar xzf /tmp/patch.tar.gz -C .
+          git config user.name "creativeflow-bot"
+          git config user.email "bot@creativeflow.local"
+          git add -A
+          git rm -f .github/workflows/sync-once.yml
+          git commit -m "feat(conversation): forceGenerate - stop discovery on explicit generate request, defaults, decline tracking, router priority, tests A-F"
+          git push

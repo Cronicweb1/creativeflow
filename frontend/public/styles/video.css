@@ -38,3 +38,20 @@
   align-self: flex-start;
   cursor: pointer;
 }
+
+/* ---------- mobile: keep the floating panel compact and out of the way ---------- */
+@media (max-width: 640px) {
+  .video-panel {
+    left: 10px;
+    right: 10px;
+    bottom: 10px;
+    width: auto;
+    padding: 12px;
+    gap: 8px;
+    max-height: 42vh;
+    overflow-y: auto;
+  }
+  .video-panel video { max-height: 150px; }
+  .video-panel-head { font-size: 14px; }
+  .video-panel-note { font-size: 12px; }
+}

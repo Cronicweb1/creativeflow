@@ -187,13 +187,19 @@ const NOUN = "[a-z0-9' -]+?";
 const END = "(?=\\s*(?:$|[.!?,;:]|\\band\\b|\\bdon'?t\\b|\\bdo not\\b|\\bplease\\b|\\bnow\\b|\\bthat\\b|\\bwhich\\b))";
 
 const PRODUCT_PATTERNS: RegExp[] = [
-  // "... ad/commercial/video for my premium skincare serum"
-  new RegExp(`\\b(?:ad|advert|advertisement|commercial|promo|video)\\s+for\\s+(${NOUN})${END}`),
+  // "... ad for my premium skincare serum" AND
+  // "... ad campaign for remote control car" ("campaign" may sit between
+  // the ad word and "for" — e.g. "an ad campaign for a remote control car").
+  new RegExp(
+    `\\b(?:ad|advert|advertisement|commercial|promo|video)(?:\\s+campaign)?\\s+for\\s+(${NOUN})${END}`,
+  ),
+  // "... (marketing) campaign for my bakery" (bare "campaign for X")
+  new RegExp(`\\b(?:marketing\\s+|promo(?:tional)?\\s+)?campaign\\s+for\\s+(${NOUN})${END}`),
   // "... about my handmade candle shop"
   new RegExp(`\\b(?:about|promoting|showcasing|featuring|advertising|selling)\\s+(${NOUN})${END}`),
-  // "create a makeup kit ad" / "make a coffee subscription commercial"
+  // "create a makeup kit ad" / "make a remote control car ad campaign"
   new RegExp(
-    `\\b(?:create|make|generate|produce|build|want|need|do)\\s+(?:me\\s+)?(?:an?\\s+|the\\s+)?(${NOUN})\\s+(?:ad|advert|advertisement|commercial|promo)\\b`,
+    `\\b(?:create|make|generate|produce|build|want|need|do)\\s+(?:me\\s+)?(?:an?\\s+|the\\s+)?(${NOUN})\\s+(?:ad|advert|advertisement|commercial|promo)(?:\\s+campaign)?\\b`,
   ),
   // "skincare serum advertisement" (bare noun phrase + ad word)
   new RegExp(`(?:^|[.!?;,]\\s*)(${NOUN})\\s+(?:ad|advert|advertisement|commercial)\\b`),
@@ -217,6 +223,7 @@ export function extractContentType(text: string): string | null {
   const t = (text ?? "").toLowerCase();
   if (/\bproduct video\b/.test(t)) return "product video";
   if (/\b(ad|advert|advertisement|commercial|promo)\b/.test(t)) return "video advertisement";
+  if (/\bcampaign\b/.test(t)) return "video advertisement";
   return null;
 }
 

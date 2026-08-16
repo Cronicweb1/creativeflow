@@ -593,3 +593,318 @@ export class SimulatedVoiceInput {
     this.stream = null;
   }
 }
+
+/* ================= MediaRecorder → server-side STT engine ================= */
+
+/**
+ * Chrome's Web Speech API SpeechRecognition depends on an external Google
+ * speech service that failed in production ("recognition error: network")
+ * even with a live microphone. The PRIMARY voice-input path is therefore:
+ *
+ *   microphone → MediaRecorder → POST /api/voice/transcribe (multipart)
+ *   → server-side Groq Whisper → { text } → onTranscript → copilot turn
+ *
+ * The Groq API key never reaches this file — transcription happens entirely
+ * on the CreativeFlow backend. TTS stays browser speechSynthesis.
+ */
+
+const RECORDER_MIMES = [
+  "audio/webm;codecs=opus",
+  "audio/webm",
+  "audio/mp4",
+  "audio/ogg;codecs=opus",
+  "audio/ogg",
+];
+
+/** Feature-detect the best supported recorder MIME ("" = browser default). */
+export function pickRecorderMime() {
+  const MR = window.MediaRecorder;
+  if (!MR || typeof MR.isTypeSupported !== "function") return "";
+  for (const mime of RECORDER_MIMES) {
+    try {
+      if (MR.isTypeSupported(mime)) return mime;
+    } catch {
+      /* keep looking */
+    }
+  }
+  return "";
+}
+
+const MAX_RECORD_MS = 60_000; // hard cap — never record longer than a minute
+const MIN_BLOB_BYTES = 800; // below this the clip cannot contain speech
+const SILENCE_STOP_MS = 3_200; // auto-finish after this much trailing silence
+const NO_SPEECH_GIVEUP_MS = 12_000; // nothing said at all → give up quietly
+const SILENCE_RMS = 0.015; // RMS threshold separating speech from room noise
+
+export class RecordedVoiceInput extends BrowserVoiceInput {
+  /** MediaRecorder + mic + TTS in a secure context — no SpeechRecognition needed. */
+  static isSupported() {
+    const supported =
+      window.isSecureContext !== false &&
+      typeof window.MediaRecorder !== "undefined" &&
+      Boolean(navigator.mediaDevices?.getUserMedia) &&
+      typeof window.speechSynthesis !== "undefined";
+    dbg({ supported });
+    return supported;
+  }
+
+  constructor() {
+    super();
+    this.onTranscribing = null; // (bool) — "Transcribing…" UI state
+    this._recorder = null;
+    this._recStream = null;
+    this._chunks = [];
+    this._cancelled = false;
+    this._starting = false;
+    this._transcribing = false; // duplicate-upload guard
+    this._maxTimer = 0;
+    this._silenceCtx = null;
+    this._silenceRaf = 0;
+  }
+
+  /* ------------------------ recording ------------------------ */
+
+  async startListening() {
+    if (this.muted || this.listening || this._starting || this._transcribing) return;
+    if (!RecordedVoiceInput.isSupported()) {
+      this.onError?.("unsupported");
+      return;
+    }
+    this._starting = true;
+    dlog("requesting microphone");
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      this._starting = false;
+      const name = err?.name || "";
+      dlog("microphone rejected:", name);
+      this.onError?.(name === "NotFoundError" || name === "DevicesNotFoundError" ? "audio" : "denied");
+      return;
+    }
+    dlog("microphone granted");
+
+    const mime = pickRecorderMime();
+    let recorder;
+    try {
+      recorder = mime
+        ? new window.MediaRecorder(stream, { mimeType: mime })
+        : new window.MediaRecorder(stream);
+    } catch (err) {
+      this._starting = false;
+      stream.getTracks?.().forEach((t) => t.stop());
+      dlog("MediaRecorder failed:", err?.name || err);
+      this.onError?.("record-failed");
+      return;
+    }
+
+    this._recStream = stream;
+    this._recorder = recorder;
+    this._chunks = [];
+    this._cancelled = false;
+
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) this._chunks.push(e.data);
+    };
+    recorder.onstart = () => {
+      this._starting = false;
+      this.listening = true;
+      dlog("recording started (", recorder.mimeType || mime || "browser default", ")");
+      this.onListeningStateChange?.(true);
+      this._maxTimer = setTimeout(() => {
+        dlog("max recording duration reached — finishing");
+        this.finishListening();
+      }, MAX_RECORD_MS);
+      this._watchSilence(stream);
+    };
+    recorder.onerror = (e) => {
+      dlog("recorder error:", e?.error?.name || e);
+      this._cancelled = true;
+      this._teardownRecording();
+      this.onError?.("record-failed");
+    };
+    recorder.onstop = () => {
+      const blob = new Blob(this._chunks, { type: recorder.mimeType || mime || "audio/webm" });
+      const cancelled = this._cancelled;
+      this._teardownRecording();
+      if (cancelled) {
+        dlog("recording cancelled — clip discarded");
+        return;
+      }
+      dlog("recording stopped · audio blob created:", blob.size, "bytes");
+      if (blob.size < MIN_BLOB_BYTES) {
+        this.onError?.("silence");
+        return;
+      }
+      void this._transcribe(blob);
+    };
+
+    try {
+      recorder.start(250);
+    } catch (err) {
+      this._starting = false;
+      this._teardownRecording();
+      dlog("recorder.start failed:", err?.name || err);
+      this.onError?.("record-failed");
+    }
+  }
+
+  /** User tapped the mic again (or silence detected): stop and transcribe. */
+  finishListening() {
+    if (!this._recorder || this._recorder.state !== "recording") return;
+    this._cancelled = false;
+    try {
+      this._recorder.stop();
+    } catch {
+      /* already stopped */
+    }
+  }
+
+  /** Cancel: stop recording and DISCARD the clip (mute, close, typed input). */
+  stopListening() {
+    if (!this._recorder) return;
+    this._cancelled = true;
+    try {
+      if (this._recorder.state === "recording") this._recorder.stop();
+      else this._teardownRecording();
+    } catch {
+      this._teardownRecording();
+    }
+  }
+
+  _teardownRecording() {
+    clearTimeout(this._maxTimer);
+    this._maxTimer = 0;
+    this._stopSilenceWatch();
+    this._recStream?.getTracks?.().forEach((t) => t.stop());
+    this._recStream = null;
+    this._recorder = null;
+    if (this.listening) {
+      this.listening = false;
+      this.onListeningStateChange?.(false);
+    }
+  }
+
+  /* ------------------------ silence auto-stop ------------------------ */
+
+  /**
+   * Auto-finish the clip after trailing silence so the visitor doesn't have
+   * to tap twice. Uses a lightweight analyser; if AudioContext is missing
+   * (old browsers, tests) tap-to-finish still works.
+   */
+  _watchSilence(stream) {
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      const ctx = new Ctx();
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      source.connect(analyser);
+      const buf = new Float32Array(analyser.fftSize);
+      this._silenceCtx = ctx;
+      const startedAt = Date.now();
+      let lastSpeech = 0;
+      const check = () => {
+        if (!this._silenceCtx) return;
+        analyser.getFloatTimeDomainData(buf);
+        let sum = 0;
+        for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+        const rms = Math.sqrt(sum / buf.length);
+        const now = Date.now();
+        if (rms >= SILENCE_RMS) lastSpeech = now;
+        if (lastSpeech && now - lastSpeech > SILENCE_STOP_MS) {
+          dlog("trailing silence — finishing recording");
+          this.finishListening();
+          return;
+        }
+        if (!lastSpeech && now - startedAt > NO_SPEECH_GIVEUP_MS) {
+          dlog("no speech detected — cancelling recording");
+          this.stopListening();
+          this.onError?.("silence");
+          return;
+        }
+        this._silenceRaf = setTimeout(check, 200);
+      };
+      check();
+    } catch {
+      /* silence watch is best-effort — tap-to-finish always works */
+    }
+  }
+
+  _stopSilenceWatch() {
+    clearTimeout(this._silenceRaf);
+    this._silenceRaf = 0;
+    try {
+      this._silenceCtx?.close();
+    } catch {
+      /* already closed */
+    }
+    this._silenceCtx = null;
+  }
+
+  /* ------------------------ transcription upload ------------------------ */
+
+  async _transcribe(blob) {
+    if (this._transcribing) return; // one clip → one upload
+    this._transcribing = true;
+    this.onTranscribing?.(true);
+    dlog("uploading audio for transcription (", blob.size, "bytes )");
+    const form = new FormData();
+    const ext = /mp4/.test(blob.type) ? "mp4" : /ogg/.test(blob.type) ? "ogg" : "webm";
+    form.append("audio", blob, `clip.${ext}`);
+    let res;
+    try {
+      // NO manual Content-Type — the browser sets the multipart boundary.
+      res = await fetch("/api/voice/transcribe", { method: "POST", body: form });
+    } catch {
+      this._transcribing = false;
+      this.onTranscribing?.(false);
+      dlog("transcription upload failed (network)");
+      this.onError?.("transcribe-unavailable");
+      return;
+    }
+    let text = "";
+    if (res.ok) {
+      try {
+        const data = await res.json();
+        text = typeof data?.text === "string" ? data.text.trim() : "";
+      } catch {
+        /* treated as empty below */
+      }
+    }
+    this._transcribing = false;
+    this.onTranscribing?.(false);
+    if (!res.ok) {
+      dlog("transcription failed: HTTP", res.status);
+      this.onError?.(res.status >= 500 ? "transcribe-unavailable" : "transcribe-failed");
+      return;
+    }
+    if (!text) {
+      dlog("empty transcript — nothing submitted");
+      this.onError?.("silence");
+      return;
+    }
+    dlog("transcription received:", text);
+    dbg({ lastFinalTranscript: text });
+    this.onTranscript?.(text); // exactly once per clip
+  }
+
+  /* ------------------------ TTS (browser only) ------------------------ */
+
+  /** speechSynthesis only — this engine NEVER calls /api/tts. */
+  async speak(text) {
+    const clean = toSpeakableText(text);
+    if (!clean) return false;
+    this.stopSpeaking();
+    return this._speakViaBrowser(clean);
+  }
+
+  /* ------------------------ teardown ------------------------ */
+
+  stop() {
+    this.stopListening();
+    this.stopSpeaking();
+    this._teardownRecording();
+  }
+}

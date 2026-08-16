@@ -27,6 +27,7 @@
 import { api } from "./api.js";
 import { BrowserVoiceInput, RecordedVoiceInput } from "./voice.js";
 import { RenderedPreview } from "./preview.js";
+import { getCompletedVideo, resolveResultMedia, resetVideoUi } from "./videoStatus.js";
 
 const DEBUG =
   /[?&]debug\b/.test(window.location.search) ||
@@ -107,6 +108,10 @@ export class DemoExperience {
   }
 
   teardown() {
+    if (this._videoDoneHandler) {
+      document.removeEventListener("cf:video-completed", this._videoDoneHandler);
+      this._videoDoneHandler = null;
+    }
     clearInterval(this.timerId);
     clearInterval(this.pollId);
     this.preview?.destroy();
@@ -769,16 +774,28 @@ export class DemoExperience {
     const s = this.job.summary;
     const spec = `${asset.durationSeconds} sec · ${this.brief.requirements.find((r) => r.field === "platform")?.value ?? "—"} · ${asset.aspectRatio}`;
 
+
+    // Part 1: the REAL completed Veo video (same URL as the floating player).
+    // Falls back to the existing simulated canvas preview until completion.
+    this.preview?.destroy();
+    this.preview = null;
+    const media = resolveResultMedia(
+      this.session ? getCompletedVideo(this.session.sessionId) : null,
+      asset,
+    );
+    const real = media.kind === "real";
     const view = this.setView(`
       <div class="result-view">
         <p class="eyebrow">Production complete</p>
         <h2>Creative ready.</h2>
         <div class="result-grid">
-          <div class="player" data-el="player">
-            ${asset.url
-              ? `<video src="${asset.url}" playsinline loop></video>`
-              : `<canvas></canvas><span class="sim-render-tag">AI generated</span>`}
-            <div class="player-ui">
+          <div class="player${real ? " player-real" : ""}" data-el="player">
+            ${real
+              ? `<video class="real-video" src="${media.videoUrl}" controls playsinline preload="metadata"></video><span class="sim-render-tag ai-tag">AI GENERATED</span>`
+              : media.kind === "mock"
+                ? `<video src="${media.videoUrl}" playsinline loop></video>`
+                : `<canvas></canvas><span class="sim-render-tag">${media.label}</span>`}
+            ${real ? "" : `<div class="player-ui">
               <button class="pbtn" data-a="play" aria-label="Play">
                 <svg viewBox="0 0 16 16" data-el="play-ic"><path d="M4 2.5v11l9-5.5z"/></svg>
               </button>
@@ -787,12 +804,13 @@ export class DemoExperience {
               <button class="pbtn" data-a="fs" aria-label="Fullscreen">
                 <svg viewBox="0 0 16 16"><path d="M2 6V2h4v1.5H3.5V6H2zm8-4h4v4h-1.5V3.5H10V2zM2 10h1.5v2.5H6V14H2v-4zm12 0H14v4h-4v-1.5h2.5V10z"/></svg>
               </button>
-            </div>
+            </div>`}
           </div>
           <div class="result-meta">
             <p class="meta-title">${escapeHtml(this.brief.title)}</p>
             <p class="meta-spec">${spec}</p>
             <div class="result-actions">
+              ${real ? `<a class="btn btn-accent" data-a="download" href="${media.downloadUrl}" download="creativeflow-video.mp4" target="_blank" rel="noopener">Download Video</a>` : ""}
               <button class="btn btn-primary" data-a="fs2">Watch fullscreen</button>
               <button class="btn btn-ghost" data-a="view-brief">View creative brief</button>
               <button class="btn btn-ghost" data-a="restart">Start another project</button>
@@ -815,62 +833,90 @@ export class DemoExperience {
     `);
 
     const playerEl = view.querySelector("[data-el=player]");
-    const bar = view.querySelector("[data-el=bar]");
-    const time = view.querySelector("[data-el=time]");
-    const playIc = view.querySelector("[data-el=play-ic]");
     const video = playerEl.querySelector("video");
     const canvas = playerEl.querySelector("canvas");
 
-    let isPlaying = false;
-    const setIcon = () => {
-      playIc.innerHTML = isPlaying
-        ? '<path d="M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z"/>'
-        : '<path d="M4 2.5v11l9-5.5z"/>';
-    };
+    if (!real) {
+      // Existing simulated player UI (canvas preview or mock asset video).
+      const bar = view.querySelector("[data-el=bar]");
+      const time = view.querySelector("[data-el=time]");
+      const playIc = view.querySelector("[data-el=play-ic]");
 
-    if (video) {
-      video.addEventListener("timeupdate", () => {
-        bar.style.width = `${(video.currentTime / video.duration) * 100}%`;
-        time.textContent = fmtClock(video.currentTime);
-      });
-    } else {
-      this.preview = new RenderedPreview(canvas, {
-        durationSeconds: asset.durationSeconds ?? 8,
-        palette: this.brief.direction.colorPalette,
-      });
-      this.preview.onProgress = (p, t) => {
-        bar.style.width = `${p * 100}%`;
-        time.textContent = fmtClock(t);
+      let isPlaying = false;
+      const setIcon = () => {
+        playIc.innerHTML = isPlaying
+          ? '<path d="M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z"/>'
+          : '<path d="M4 2.5v11l9-5.5z"/>';
       };
+
+      if (video) {
+        video.addEventListener("timeupdate", () => {
+          bar.style.width = `${(video.currentTime / video.duration) * 100}%`;
+          time.textContent = fmtClock(video.currentTime);
+        });
+      } else {
+        this.preview = new RenderedPreview(canvas, {
+          durationSeconds: asset.durationSeconds ?? 8,
+          palette: this.brief.direction.colorPalette,
+        });
+        this.preview.onProgress = (p, t) => {
+          bar.style.width = `${p * 100}%`;
+          time.textContent = fmtClock(t);
+        };
+      }
+
+      const toggle = () => {
+        isPlaying = !isPlaying;
+        if (video) (isPlaying ? video.play() : video.pause());
+        else isPlaying ? this.preview.play() : this.preview.pause();
+        setIcon();
+      };
+
+      view.querySelector("[data-a=play]").addEventListener("click", toggle);
+      playerEl.addEventListener("click", (e) => {
+        if (e.target.closest(".pbtn")) return;
+        toggle();
+      });
+
+      // Autoplay the simulated preview after a beat - it is the payoff moment.
+      setTimeout(toggle, 600);
+
+      // Hot-swap: when the real Veo video completes while this view is open,
+      // re-render so the main preview shows the exact generated videoUrl.
+      const sid = this.session?.sessionId;
+      if (sid) {
+        if (this._videoDoneHandler)
+          document.removeEventListener("cf:video-completed", this._videoDoneHandler);
+        const handler = (e) => {
+          if (e.detail?.sessionId !== sid) return;
+          document.removeEventListener("cf:video-completed", handler);
+          this._videoDoneHandler = null;
+          if (this.stage.querySelector(".result-view")) this.renderResult();
+        };
+        this._videoDoneHandler = handler;
+        document.addEventListener("cf:video-completed", handler);
+      }
     }
 
-    const toggle = () => {
-      isPlaying = !isPlaying;
-      if (video) (isPlaying ? video.play() : video.pause());
-      else isPlaying ? this.preview.play() : this.preview.pause();
-      setIcon();
-    };
-
-    view.querySelector("[data-a=play]").addEventListener("click", toggle);
-    playerEl.addEventListener("click", (e) => {
-      if (e.target.closest(".pbtn")) return;
-      toggle();
-    });
-    const goFullscreen = () => playerEl.requestFullscreen?.();
-    view.querySelector("[data-a=fs]").addEventListener("click", goFullscreen);
+    const goFullscreen = () =>
+      real && video?.requestFullscreen
+        ? video.requestFullscreen()
+        : playerEl.requestFullscreen?.();
+    view.querySelector("[data-a=fs]")?.addEventListener("click", goFullscreen);
     view.querySelector("[data-a=fs2]").addEventListener("click", goFullscreen);
     view.querySelector("[data-a=view-brief]").addEventListener("click", () => {
       const doc = view.querySelector("[data-el=brief-doc]");
       doc.classList.add("open");
       doc.scrollIntoView({ behavior: "smooth", block: "start" });
     });
-    view.querySelector("[data-a=restart]").addEventListener("click", () => this.renderPrecall());
+    view.querySelector("[data-a=restart]").addEventListener("click", () => {
+      // Start another project: clear previous video/production state fully.
+      resetVideoUi();
+      this.renderPrecall();
+    });
     view.querySelectorAll(".brief-doc-head").forEach((h) =>
       h.addEventListener("click", () => h.parentElement.classList.toggle("open")),
     );
-
-    // Autoplay the preview after a beat — it is the payoff moment.
-    setTimeout(toggle, 600);
   }
 }
 

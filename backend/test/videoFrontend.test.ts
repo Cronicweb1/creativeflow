@@ -22,7 +22,7 @@ import { fileURLToPath } from "node:url";
 import { resolve, dirname } from "node:path";
 
 // @ts-ignore - plain browser ES module, DOM-free at import time
-import { createVideoTracker, saveActiveJob, loadActiveJob, clearActiveJob } from "../../frontend/public/js/videoStatus.js";
+import { createVideoTracker, saveActiveJob, loadActiveJob, clearActiveJob, recordCompletedVideo, getCompletedVideo, clearCompletedVideos, resolveResultMedia } from "../../frontend/public/js/videoStatus.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const SERVER = resolve(ROOT, "backend/src/server.ts");
@@ -430,4 +430,89 @@ test("mcp: ComposioVeoVideoService full flow over a fake MCP server (SSE), no ke
     "tools/call",
   ]);
   assert.ok(!JSON.stringify(done).includes(KEY), "key never appears in job state");
+});
+
+/* ================================================================
+   Main production preview <-> completed-video registry (Part 1).
+   Tests A-G of the frontend task, DOM-free.
+   ================================================================ */
+
+test("A: no completed video -> main preview shows placeholder (no videoUrl)", () => {
+  clearCompletedVideos();
+  const media = resolveResultMedia(getCompletedVideo("s-a"), { url: null });
+  assert.equal(media.kind, "placeholder");
+  assert.equal(media.videoUrl, null);
+});
+
+test("B: completed status with videoUrl replaces the main placeholder", () => {
+  clearCompletedVideos();
+  recordCompletedVideo("s-b", { videoUrl: URL_OK, downloadUrl: URL_OK });
+  const media = resolveResultMedia(getCompletedVideo("s-b"), { url: null });
+  assert.equal(media.kind, "real");
+  assert.equal(media.label, "AI GENERATED");
+});
+
+test("C: main preview uses exactly the returned videoUrl", () => {
+  clearCompletedVideos();
+  recordCompletedVideo("s-c", { videoUrl: URL_OK, downloadUrl: "https://cdn.example.com/dl.mp4" });
+  const media = resolveResultMedia(getCompletedVideo("s-c"), null);
+  assert.equal(media.videoUrl, URL_OK);
+  assert.equal(media.downloadUrl, "https://cdn.example.com/dl.mp4");
+});
+
+test("D: floating player and main preview derive from the same completed state", () => {
+  clearCompletedVideos();
+  const state = { phase: "completed", sessionId: "s-d", videoUrl: URL_OK, downloadUrl: URL_OK };
+  // renderState records the exact state it renders in the floating panel.
+  const entry = recordCompletedVideo(state.sessionId, state);
+  assert.equal(entry.videoUrl, state.videoUrl);
+  assert.equal(getCompletedVideo("s-d").videoUrl, state.videoUrl);
+});
+
+test("E: failed generation never attaches an invalid video URL", () => {
+  clearCompletedVideos();
+  assert.equal(recordCompletedVideo("s-e", { videoUrl: null }), null);
+  assert.equal(recordCompletedVideo("s-e", { videoUrl: "blob:fake" }), null);
+  assert.equal(recordCompletedVideo("s-e", {}), null);
+  const media = resolveResultMedia(getCompletedVideo("s-e"), { url: "not-a-url" });
+  assert.equal(media.kind, "placeholder");
+  assert.equal(media.videoUrl, null);
+});
+
+test("F: start another project clears the previous video", () => {
+  clearCompletedVideos();
+  recordCompletedVideo("s-f", { videoUrl: URL_OK });
+  assert.ok(getCompletedVideo("s-f"));
+  clearCompletedVideos(); // called by resetVideoUi() on restart/new session
+  assert.equal(getCompletedVideo("s-f"), null);
+  assert.equal(resolveResultMedia(getCompletedVideo("s-f"), { url: null }).kind, "placeholder");
+});
+
+test("G: resumed job reaching completed updates the registry for the main preview", async () => {
+  clearCompletedVideos();
+  const updates: any[] = [];
+  const tracker = createVideoTracker({
+    fetchJson: async (_m: string, path: string) => {
+      if (path.includes("/status/")) {
+        return { jobId: "job-g", status: "completed", videoUrl: URL_OK, downloadUrl: URL_OK };
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+    onUpdate: (st: any) => {
+      updates.push(st);
+      if (st.phase === "completed") recordCompletedVideo(st.sessionId, st); // browser renderState path
+    },
+    delay: async () => {},
+    now: () => 0,
+  });
+  await tracker.track({ sessionId: "s-g", productionBrief: null, jobId: "job-g" }); // resume path: jobId only
+  const done = updates.find((u) => u.phase === "completed");
+  assert.ok(done, "tracker reached completed");
+  assert.equal(getCompletedVideo("s-g")?.videoUrl, URL_OK);
+});
+
+test("registry: missing downloadUrl falls back to videoUrl", () => {
+  clearCompletedVideos();
+  recordCompletedVideo("s-h", { videoUrl: URL_OK });
+  assert.equal(getCompletedVideo("s-h").downloadUrl, URL_OK);
 });

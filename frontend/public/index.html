@@ -45,7 +45,8 @@
 
       <!-- Hero -->
       <section class="hero">
-        <div class="shell">
+        <div class="shell hero-grid">
+          <div class="hero-copy">
           <p class="eyebrow">AI creative production, end to end</p>
           <h1 class="hero-headline">From client conversation<br />to finished creative.</h1>
           <p class="hero-sub">
@@ -63,6 +64,27 @@
             This interactive demo simulates the phone-call experience directly in your browser.
             In production, the same workflow can be connected to real telephony.
           </p>
+          <ul class="hero-trust" aria-label="Capabilities">
+            <li>Real Gemini Veo video generation</li>
+            <li>Voice-first client briefing</li>
+            <li>Typed fallback included</li>
+          </ul>
+          </div>
+          <aside class="hero-flow" aria-hidden="true">
+            <div class="flow-card">
+              <p class="flow-title">Production workflow</p>
+              <div class="flow-node"><span class="flow-k">When</span><span class="flow-v">Client describes the campaign</span></div>
+              <div class="flow-arrow"></div>
+              <div class="flow-node"><span class="flow-k">Do</span><span class="flow-v">Extract the creative brief</span></div>
+              <div class="flow-arrow"></div>
+              <div class="flow-branch">
+                <div class="flow-node small"><span class="flow-k">Ready</span><span class="flow-v">Generate with Gemini Veo</span></div>
+                <div class="flow-node small"><span class="flow-k">Missing</span><span class="flow-v">Ask a follow-up question</span></div>
+              </div>
+              <div class="flow-arrow"></div>
+              <div class="flow-node done"><span class="flow-k">Deliver</span><span class="flow-v">Finished video, ready to download</span></div>
+            </div>
+          </aside>
         </div>
       </section>
 

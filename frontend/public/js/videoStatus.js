@@ -252,6 +252,78 @@ function removePanel() {
   panelEl = null;
 }
 
+
+/* ---------- completed-video registry (DOM-free, shared with demo.js) ---------- */
+
+const HTTP_RE = /^https?:\/\//i;
+const completedVideos = new Map();
+
+/**
+ * Record a completed generation so other views (the main production preview
+ * in demo.js) can reuse the SAME videoUrl. Never fabricates URLs.
+ */
+export function recordCompletedVideo(sessionId, state = {}) {
+  const { videoUrl, downloadUrl } = state;
+  if (!sessionId || typeof videoUrl !== "string" || !HTTP_RE.test(videoUrl)) return null;
+  const entry = {
+    sessionId,
+    videoUrl,
+    downloadUrl:
+      typeof downloadUrl === "string" && HTTP_RE.test(downloadUrl) ? downloadUrl : videoUrl,
+  };
+  completedVideos.set(sessionId, entry);
+  return entry;
+}
+
+/** The completed video for a session, or null. */
+export function getCompletedVideo(sessionId) {
+  return (sessionId && completedVideos.get(sessionId)) || null;
+}
+
+/** Clear all completed-video state (new project / demo closed). */
+export function clearCompletedVideos() {
+  completedVideos.clear();
+}
+
+/**
+ * Decide what the MAIN production preview should show. Pure and DOM-free so
+ * it is unit-testable in Node:
+ *   - real Veo video when the session has a completed generation
+ *   - mock asset video when one exists (legacy/simulated path)
+ *   - canvas placeholder otherwise (also for failed/incomplete jobs)
+ */
+export function resolveResultMedia(completed, asset) {
+  if (completed && typeof completed.videoUrl === "string" && HTTP_RE.test(completed.videoUrl)) {
+    return {
+      kind: "real",
+      videoUrl: completed.videoUrl,
+      downloadUrl: completed.downloadUrl || completed.videoUrl,
+      label: "AI GENERATED",
+    };
+  }
+  if (asset && typeof asset.url === "string" && HTTP_RE.test(asset.url)) {
+    return { kind: "mock", videoUrl: asset.url, downloadUrl: null, label: "Concept preview" };
+  }
+  return { kind: "placeholder", videoUrl: null, downloadUrl: null, label: "Concept preview" };
+}
+
+/** Browser-only: notify open views (demo.js result page) of a completion. */
+function announceCompleted(state) {
+  try {
+    document.dispatchEvent(
+      new CustomEvent("cf:video-completed", {
+        detail: {
+          sessionId: state.sessionId,
+          videoUrl: state.videoUrl,
+          downloadUrl: state.downloadUrl || state.videoUrl,
+        },
+      }),
+    );
+  } catch {
+    /* non-browser environment */
+  }
+}
+
 function ensurePanel() {
   const root = demoRoot();
   if (panelEl && root.contains(panelEl)) return panelEl;
@@ -280,6 +352,9 @@ function renderState(state) {
   const el = ensurePanel();
   if (state.phase === "completed") {
     clearActiveJob(getStorage());
+    // Share the completed URL with the main production preview (demo.js).
+    recordCompletedVideo(state.sessionId, state);
+    announceCompleted(state);
     // Only ever shown with a REAL videoUrl returned by the status endpoint.
     el.innerHTML = `<div class="video-panel-head done">Your video is ready</div>`;
     const video = document.createElement("video");
@@ -386,6 +461,7 @@ export function resumeVideoUi(fetchJson) {
 /** Reset on a fresh demo session so a new conversation starts clean. */
 export function resetVideoUi() {
   clearActiveJob(getStorage());
+  clearCompletedVideos();
   uiTracker?.stop();
   uiTracker = null;
   removePanel();

@@ -1,5 +1,14 @@
 import type { ConversationService, MockConversationService } from "./conversationService.ts";
 import type { CreativeRequirement, RequirementField } from "../types/creative.ts";
+import {
+  FORCE_GENERATE_REPLY,
+  FORCE_GENERATE_SYSTEM_INSTRUCTION,
+  buildForcedBrief,
+  detectDecline,
+  detectForceGenerate,
+  FIELD_DEFAULTS,
+  inferAskedField,
+} from "./forceGenerate.ts";
 
 /**
  * Copilot Studio bridge — the conversational intelligence ("brain") layer.
@@ -37,6 +46,8 @@ export interface CopilotTurnResult {
   productionBrief: Record<string, unknown> | null;
   provider: "mock" | "live";
   degraded?: boolean;
+  /** True when the user explicitly requested generation without more questions. */
+  forceGenerate?: boolean;
 }
 
 export interface CopilotProvider {
@@ -166,6 +177,8 @@ class LiveCopilotProvider implements CopilotProvider {
           sessionId: input.sessionId,
           userMessage: input.userMessage,
           conversationState: input.conversationState,
+          // Forwarded so the Groq system prompt can enforce force-generation.
+          systemInstruction: FORCE_GENERATE_SYSTEM_INSTRUCTION,
         }),
       });
       if (!res.ok) throw new Error(`copilot_http_${res.status}`);
@@ -298,6 +311,128 @@ export function buildProductionPayload(
   };
 }
 
+
+interface GuardState {
+  forced: boolean;
+  declined: Set<RequirementField>;
+  lastAsked: RequirementField | null;
+}
+
+/**
+ * Provider wrapper that enforces the conversation guarantees regardless of
+ * which provider (mock or live/Groq) answers:
+ *
+ *  1. Explicit "just generate it / no more questions" => discovery stops
+ *     IMMEDIATELY: no further question, defaults for unspecified fields,
+ *     readyForProduction=true and a complete productionBrief.
+ *  2. A field the user explicitly declined is resolved (null/default) and
+ *     is NEVER asked again.
+ */
+export class GuardedCopilotProvider implements CopilotProvider {
+  private inner: CopilotProvider;
+  private conversation: ConversationService & Partial<MockConversationService>;
+  private states = new Map<string, GuardState>();
+
+  constructor(
+    inner: CopilotProvider,
+    conversation: ConversationService & Partial<MockConversationService>,
+  ) {
+    this.inner = inner;
+    this.conversation = conversation;
+  }
+
+  get name(): "mock" | "live" {
+    return this.inner.name;
+  }
+
+  private state(sessionId: string): GuardState {
+    let st = this.states.get(sessionId);
+    if (!st) {
+      st = { forced: false, declined: new Set(), lastAsked: null };
+      this.states.set(sessionId, st);
+    }
+    return st;
+  }
+
+  async turn(input: CopilotTurnInput): Promise<CopilotTurnResult> {
+    const session = this.conversation.getSession(input.sessionId);
+    if (!session) throw new Error("session_not_found");
+    const st = this.state(input.sessionId);
+
+    // Explicit decline of the field that was just asked => resolve it with
+    // a sensible default and never ask for it again.
+    if (st.lastAsked && detectDecline(input.userMessage)) {
+      const field = st.lastAsked;
+      st.declined.add(field);
+      const req = session.requirements.find((r) => r.field === field);
+      if (req && !req.value) {
+        req.value = FIELD_DEFAULTS[field];
+        req.status = "confirmed";
+        req.confidence = 0.5;
+        req.source = "client declined — default applied";
+      }
+    }
+
+    if (detectForceGenerate(input.userMessage)) st.forced = true;
+
+    if (st.forced) {
+      // Force-generation: never ask another question. Answer directly with
+      // a complete, default-filled brief — the inner provider is skipped so
+      // no model can re-open discovery.
+      session.messages.push({
+        id: crypto.randomUUID(),
+        speaker: "client",
+        text: input.userMessage,
+        at: new Date().toISOString(),
+      });
+      session.messages.push({
+        id: crypto.randomUUID(),
+        speaker: "agent",
+        text: FORCE_GENERATE_REPLY,
+        at: new Date().toISOString(),
+      });
+      if (session.phase === "gathering") session.phase = "review";
+      logTurn({
+        sessionId: input.sessionId,
+        provider: this.inner.name,
+        status: "ok",
+        latencyMs: 0,
+      });
+      return {
+        responseText: FORCE_GENERATE_REPLY,
+        requirements: requirementsToMap(session.requirements),
+        missing: [],
+        complete: true,
+        readyForProduction: true,
+        forceGenerate: true,
+        productionBrief: buildForcedBrief(input.sessionId, session.requirements),
+        provider: this.inner.name,
+      };
+    }
+
+    const result = await this.inner.turn(input);
+
+    // Never ask for a declined field again — swap in the next open field.
+    let responseText = result.responseText;
+    const asked = inferAskedField(responseText);
+    if (asked && st.declined.has(asked)) {
+      const current = this.conversation.getSession(input.sessionId);
+      const next = current?.requirements.find((r) => !r.value && !st.declined.has(r.field));
+      responseText = next
+        ? `No problem — we'll keep it ${asked === "client" ? "unbranded" : "simple"}. Could you tell me about the ${next.label.toLowerCase()}?`
+        : "I have everything I need — please review and confirm the brief on screen.";
+    }
+    st.lastAsked = inferAskedField(responseText);
+
+    return {
+      ...result,
+      responseText,
+      missing: result.missing.filter((f) => !st.declined.has(f as RequirementField)),
+      forceGenerate: false,
+    };
+  }
+}
+
 export function createCopilotProvider(
   conversation: ConversationService & Partial<MockConversationService>,
 ): CopilotProvider {
@@ -308,11 +443,14 @@ export function createCopilotProvider(
       console.warn(
         "COPILOT_PROVIDER=live but COPILOT_WORKFLOW_URL is not set — falling back to mock provider.",
       );
-      return new MockCopilotProvider(conversation);
+      return new GuardedCopilotProvider(new MockCopilotProvider(conversation), conversation);
     }
-    return new LiveCopilotProvider(url, process.env.COPILOT_AUTH_TOKEN, conversation);
+    return new GuardedCopilotProvider(
+      new LiveCopilotProvider(url, process.env.COPILOT_AUTH_TOKEN, conversation),
+      conversation,
+    );
   }
-  return new MockCopilotProvider(conversation);
+  return new GuardedCopilotProvider(new MockCopilotProvider(conversation), conversation);
 }
 
 export function copilotProviderName(): "mock" | "live" {

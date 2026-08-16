@@ -1,0 +1,25 @@
+name: sync-large-files
+on:
+  push:
+    branches: [mediarecorder-stt]
+    paths: ['.github/workflows/sync-large-files.yml']
+permissions:
+  contents: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch exact file bytes and verify checksums
+        run: |
+          curl -sSL -o frontend/public/js/voice.js "https://backend.composio.dev/api/v3/sl/MCESxCsvcb"
+          curl -sSL -o frontend/public/js/demo.js "https://backend.composio.dev/api/v3/sl/d7AZpTai7M"
+          echo "14c82ed1430873575316eebc1dbbbbf9f6ecc764ce3db096af11f3a7610627c0  frontend/public/js/voice.js" | sha256sum -c -
+          echo "b9abead947a23067a0071f3234314ac7beef477a0f7426073cfb506a25b59003  frontend/public/js/demo.js" | sha256sum -c -
+      - name: Commit verified files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add frontend/public/js/voice.js frontend/public/js/demo.js
+          git commit -m "feat(frontend): MediaRecorder -> server-side Groq STT (voice.js, demo.js)"
+          git push
